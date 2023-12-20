@@ -23,6 +23,7 @@
 #define ESP_NOW_STATE_ON           1
 #define ESP_NOW_STATE_ERROR        2
 
+bool gc_remote_filter_enabled = false;
 String gc_remote_str = "94b97e8252e8"; // used for setting storage
 char gc_remote[13]; // gets updated when loading config from json storage 
 char gc_last_src[13]; // updates when a message is received - used for comparison with gc_remote
@@ -75,10 +76,12 @@ unsigned long gc_target_time=0; // delayed execution timer
         sprintf (gc_last_src, "%02x%02x%02x%02x%02x%02x",
             mac [0], mac [1], mac [2], mac [3], mac [4], mac [5]);
 
-        if (strcmp(gc_last_src, gc_remote) != 0) {
-            DEBUG_PRINT(F("ESP Now Message Received from Unlinked Sender: "));
-            DEBUG_PRINTLN(gc_last_src);
-            return;
+        if(gc_remote_filter_enabled) {
+            if (strcmp(gc_last_src, gc_remote) != 0) {
+                DEBUG_PRINT(F("ESP Now Message Received from Unlinked Sender: "));
+                DEBUG_PRINTLN(gc_last_src);
+                return;
+            }
         }
 
         if (len != numStructBytes) {
@@ -101,17 +104,12 @@ unsigned long gc_target_time=0; // delayed execution timer
             }
             else if(gc_newData.deviceType==GET_DEVICES && (gc_currentData.groupId==gc_newData.groupId || gc_newData.groupId==255)) {
                 gc_activeCmd=IDENTIFY;
-                bri=128;
-                applyPreset(11, CALL_MODE_DIRECT_CHANGE); // applies preset but not brightness
-                //stateUpdated(CALL_MODE_DIRECT_CHANGE); // apply brightness - could also use: CALL_MODE_NO_NOTIFY
-                memcpy(&gc_rcvAddress, mac, 6); // store senders MAC for sending answer
+                memcpy(&gc_rcvAddress, mac, 6); // store senders MAC for sending answer, this data is not part of the gc_newData struct and would be lost otherwise
                 DEBUG_PRINT(F("Identify Command accepted"));
             }
             // Set groupId works only once while groupId has not been changed during runtime or if the command is received with a state of 255
             else if(gc_newData.deviceType==SET_GROUP && (gc_currentData.groupId==0 || gc_newData.state==255)) { 
                 gc_activeCmd=SETGROUP;
-                bri=128;
-                applyPreset(2, CALL_MODE_DIRECT_CHANGE); // applies preset but not brightness
                 DEBUG_PRINT(F("SetGroup Command accepted"));
             }
         }
@@ -233,12 +231,17 @@ class rh_gatecontrol_v2 : public Usermod {
                 gc_target_time=gc_now+random(100, 2000); // calculate a time between 0.1 and 2 seconds in the future
                 DEBUG_PRINT(F("Target Time set:"));
                 DEBUG_PRINT(gc_target_time);
+                //bri=128;
+                //applyPreset(11, CALL_MODE_DIRECT_CHANGE); // applies preset but not brightness
+                //stateUpdated(CALL_MODE_DIRECT_CHANGE); // apply brightness - could also use: CALL_MODE_NO_NOTIFY
             }
         }
         if(gc_activeCmd==SETGROUP) {
             gc_currentData.groupId=gc_newData.groupId;
             DEBUG_PRINT(F("GroupId has been set: "));
             DEBUG_PRINT(gc_currentData.groupId);
+            bri=128;
+            applyPreset(11, CALL_MODE_DIRECT_CHANGE); // preset 11: pulse white; applies preset but not brightness
             gc_activeCmd=NONE; // if new data packet is received while we are still busy with the last packet the new one will be ignored.
         }
 
@@ -246,6 +249,7 @@ class rh_gatecontrol_v2 : public Usermod {
 
     void addToConfig(JsonObject& root) {
         JsonObject top = root.createNestedObject("RH_GateControl");
+        top["GC_MAC_FILTER"] = gc_remote_filter_enabled;
         gc_remote_str.toLowerCase();
         top["GC_MAC"] = gc_remote_str;
     }
@@ -261,7 +265,8 @@ class rh_gatecontrol_v2 : public Usermod {
         //configComplete &= getJsonValue(top["GC_MAC"], gc_remote_str);
 
         // A 3-argument getJsonValue() assigns the 3rd argument as a default value if the Json value is missing
-        configComplete &= getJsonValue(top["GC_MAC"], gc_remote_str, "94b97e8252e8");
+        configComplete &= getJsonValue(top["GC_MAC_FILTER"], gc_remote_filter_enabled, false);
+        configComplete &= getJsonValue(top["GC_MAC"], gc_remote_str, "3030f9182890");
         gc_remote_str.toLowerCase();
         strcpy(gc_remote, gc_remote_str.c_str());
         return configComplete;
