@@ -3,12 +3,12 @@
 /*
    Main sketch, global variable declarations
    @title WLED project sketch
-   @version 0.14.1-a1
+   @version 0.14.1
    @author Christian Schwinne
  */
 
 // version code in format yymmddb (b = daily build)
-#define VERSION 2312180
+#define VERSION 2401141
 
 //uncomment this if you have a "my_config.h" file you'd like to use
 //#define WLED_USE_MY_CONFIG
@@ -315,6 +315,7 @@ WLED_GLOBAL bool noWifiSleep _INIT(true);                          // disabling 
 #else
 WLED_GLOBAL bool noWifiSleep _INIT(false);
 #endif
+WLED_GLOBAL bool force802_3g _INIT(false);
 
 #ifdef WLED_USE_ETHERNET
   #ifdef WLED_ETH_DEFAULT                                          // default ethernet board type if specified
