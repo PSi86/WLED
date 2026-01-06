@@ -1,0 +1,149 @@
+inline void service(Core& ll, const Callbacks& cb) {
+  const uint32_t now = millis();
+
+  // (A) IRQ: TX-Done oder RX-Paket
+  if (ll.dio1Flag) {
+    ll.dio1Flag = false;
+
+    if (ll.current == Mode::Rx) {
+      size_t len = ll.radio->getPacketLength();
+      if (len >= sizeof(LoraProto::Header7)) {
+        // TODO: ab hier nochmal checken! txBuf als maximale länge? -> besser hardcoden
+        // können mehrere pakete im readData buffer enthalten sein?
+        if (len > sizeof(ll.txBuf)) len = sizeof(ll.txBuf);
+        uint8_t pkt[64]; if (len > sizeof(pkt)) len = sizeof(pkt);
+        if (ll.radio->readData(pkt, len) == RADIOLIB_ERR_NONE) {
+          ll.lastRssi = (int16_t)ll.radio->getRSSI(true);
+          ll.lastSnr  = (int8_t) ll.radio->getSNR();
+          ++ll.rxCount;
+          if (cb.onRxPacket) cb.onRxPacket(pkt, (uint8_t)len, ll.lastRssi, ll.lastSnr, cb.ctx);
+        }
+      }
+      // Rx fortsetzen ( timed wird unten ggf. beendet)
+      if (ll.rxKind != RxKind::None) {
+        //ll.radio->startReceive();
+        //startRxNow(ll, cb, ll.rxKind, now);
+      }
+    }
+  }
+
+  // (B) TX pending starten, wenn sendezeit erreicht
+  if (ll.txPending && (int32_t)(now - ll.earliestTxAtMs) >= 0) {
+    ll.current = Mode::Tx;
+    if (ll.txArb == TxArbiter::CadNeeded) {
+      // zum senden in scheduleSend nur txArb auf CadNeeded und txPending auf true setzen
+      ChannelScanConfig_t cfg = {
+        .cad = {
+          .symNum = RADIOLIB_SX126X_CAD_ON_4_SYMB,   // robuste Defaults RADIOLIB_SX126X_CAD_ON_4_SYMB RADIOLIB_SX126X_CAD_ON_2_SYMB // RADIOLIB_SX126X_CAD_PARAM_DEFAULT
+          .detPeak = 16, // RADIOLIB_SX126X_CAD_PARAM_DEFAULT // default: SF+13=20
+          .detMin = 12, //RADIOLIB_SX126X_CAD_PARAM_DET_MIN, // RADIOLIB_SX126X_CAD_PARAM_DEFAULT //default: 10 // 5 zu niedrig
+          .exitMode = RADIOLIB_SX126X_CAD_GOTO_STDBY, // RADIOLIB_SX126X_CAD_PARAM_DEFAULT
+          .timeout = 0,
+          .irqFlags = RADIOLIB_IRQ_CAD_DEFAULT_FLAGS,
+          .irqMask = RADIOLIB_IRQ_CAD_DEFAULT_MASK,
+        },
+      };
+
+      //int16_t state = ll.radio->startChannelScan(cfg);
+      int16_t state = ll.radio->scanChannel(cfg);
+      
+      if (state == RADIOLIB_CHANNEL_FREE) {
+        // sofort senden
+        ll.txArb = TxArbiter::None;
+        // kein return, weiter zum senden
+      }
+      else {
+        // busy → kurzen Backoff und erneut CAD wenn Zeit erreicht
+        //ll.earliestTxAtMs = now + randMs(ll, 5, lbtBackoffMaxMs(ll));
+        ll.earliestTxAtMs = now + randMs(ll, 100, 200); // fixed backoff for LBT
+        ll.txArb = TxArbiter::CadNeeded;
+        ll.debug += 1;
+        //if(ll.debug <= 2) ll.debug = 2;
+        return; // kein weiterer Service jetzt
+      }
+    }
+    if(ll.txArb == TxArbiter::None) {
+      if (ll.radio->transmit(ll.txBuf, ll.txLen) == RADIOLIB_ERR_NONE) {
+        ll.txPending = false;
+        ll.debug = 100;
+        if (cb.onTxDone) cb.onTxDone(cb.ctx);
+        ll.current = Mode::Idle;
+        return; // gesendet, nun platz machen für restlichen code
+      }
+      else {
+        ll.txArb = TxArbiter::CadNeeded;
+        return;
+      }
+    }
+  }
+  if (ll.current == Mode::Rx) {
+
+  }
+  // RX muss non blocking bleiben!
+
+  // TODO: rx request szenarios:
+  // 1) bereits in rx Mode
+  //    a) in timed Mode + reqMode=cont mode -> rxWindowEndMs=0 setzen
+  //    b) in continous mode + reqMode=timed mode -> rxWindowEndMs auf wert > 0 setzen
+  // 2) in idle mode
+  //    gewünschten modus aktivieren
+  // 3) in tx mode
+  //    ignorieren bis tx beendet
+
+  // (C) RX-Request nur aus Idle bedienen
+  // C1: Expliziten Request bedienen (nur aus Idle)
+  if (!ll.txPending && ll.rxKind != reqRxKind ) {
+    // kein senden, also empfangsmodus einstellen, wenn ll.rxKind != reqRxKind 
+    if(ll.current == Mode::Idle) {
+      // start RX
+      startRxNow(ll, cb, ll.reqRxKind, now); // funktion eher entpacken, timeout direkt hier als variable setzen
+    }
+    else if (ll.current == Mode::RX && ll.rxKind != ll.reqRxKind) {
+      ll.rxKind = ll.reqRxKind;
+      ll.reqRxKind = RxKind::None;
+      if(ll.reqRxKind==RxKind::Timed) {
+        // setze rxWindowEndMs reqRxMs
+        ll.reqRxMs = 0;
+      }
+      else if(ll.reqRxKind==RxKind::Continous) {
+        // setze rxWindowEndMs =0
+      }
+    }
+  }
+
+  // C2: Default durchsetzen
+  //  - Falls wir in RxContinuous sind, der Default aber ≠ Continuous ist:
+  //    Continuous sofort beenden und in Idle bleiben (neuer Default wird in der nächsten Iteration geöffnet).
+  if (ll.current == Mode::Rx && ll.reqRxKind == RxKind::None && ll.rxKind == RxKind::Continuous &&
+      ll.defaultRxKind != RxKind::Continuous) {
+    ll.radio->standby();
+    ll.current = Mode::Idle;
+    ll.rxKind  = RxKind::None;
+    ll.rxWindowEndMs = 0;
+  }
+
+  //  - Falls wir Idle sind (und kein expliziter Request ansteht): Default öffnen.
+  if (ll.current == Mode::Idle && ll.reqRxKind == RxKind::None &&
+      ll.defaultRxKind != RxKind::None && !ll.txPending) {
+    ll.reqRxMs = ll.defaultRxMs;               // für Timed
+    startRxNow(ll, cb, ll.defaultRxKind, now);
+  }
+
+  // (D) RX-Timed: Fensterende prüfen
+  if (ll.current == Mode::Rx && ll.rxKind == RxKind::Timed && ll.rxWindowEndMs != 0) {
+    if ((int32_t)(now - ll.rxWindowEndMs) >= 0) {
+      ll.radio->standby();
+      ll.current = Mode::Idle;
+      const uint16_t delta = ll.rxCount - ll.rxCountWinStart;
+      if (cb.onRxWindowClosed) cb.onRxWindowClosed(delta, cb.ctx);
+      ll.rxKind = RxKind::None;
+      ll.rxWindowEndMs = 0;
+
+      // Default (falls gesetzt) direkt öffnen
+      if (ll.defaultRxKind != RxKind::None) {
+        ll.reqRxMs = ll.defaultRxMs;
+        startRxNow(ll, cb, ll.defaultRxKind, now);
+      }
+    }
+  }
+}

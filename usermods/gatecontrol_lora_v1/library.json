@@ -1,0 +1,9 @@
+{
+  "name": "gatecontrol_lora_v1",
+  "build": {
+    "libArchive": false
+  },
+  "dependencies": {
+    "jgromes/RadioLib" : "^7.4.0"
+  }
+}
