@@ -57,8 +57,8 @@ static UsermodGateControlLoRa* s_gateSelf = nullptr;
 void UsermodGateControlLoRa::setup() {
   // init defaults for current gate state
   current.groupId    = 0;
-  current.state      = 0;
-  current.effect     = 11;
+  current.flags      = 0;
+  current.presetId     = 11;
   current.brightness = 128;
 
   // read MAC from efuse (no WiFi init required)
@@ -191,6 +191,30 @@ void UsermodGateControlLoRa::addToJsonInfo(JsonObject& root) {
     JsonArray row = user.createNestedArray(F("Group"));
     row.add(String(current.groupId));
   }
+
+  // Pending preset / sync status
+  {
+    JsonArray row = user.createNestedArray(F("Preset Armed"));
+    row.add(pending.armed ? F("yes") : F("no"));
+
+    JsonArray row2 = user.createNestedArray(F("Pending Preset"));
+    row2.add(String(pending.presetId));
+
+    JsonArray row3 = user.createNestedArray(F("Pending Flags"));
+    char f[8];
+    snprintf(f, sizeof(f), "0x%02X", pending.flags);
+    row3.add(f);
+
+    JsonArray row4 = user.createNestedArray(F("Last SYNC"));
+    if (!haveSync) {
+      row4.add(F("(none)"));
+    } else {
+      uint32_t ageMs = millis() - lastSyncLocalMs;
+      char s[24];
+      snprintf(s, sizeof(s), "%lums ago", (unsigned long)ageMs);
+      row4.add(s);
+    }
+  }
 }
 
 // ========= Config =========
@@ -257,9 +281,10 @@ bool UsermodGateControlLoRa::readFromConfig(JsonObject& root) {
 
 void UsermodGateControlLoRa::onStateChange(uint8_t mode) {
   // TODO: test! currently status does not send current bri/effect/state -> change this! -> send FW and maybe other params in identify reply instead
-  current.effect     = effectCurrent;
+  // In this usermod, current.effect is treated as the last commanded PRESET ID (not effect index).
+  // Avoid overwriting it with effectCurrent (which is an effect index) on generic state changes.
   current.brightness = bri;
-  current.state      = (bri > 0) ? 1 : 0;
+  current.flags      = (bri > 0) ? 1 : 0; // TODO: handle ON/OFF properly // use flags
 }
 
 // ========= Radio =========
@@ -383,19 +408,90 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
       bri = 128;
       applyPreset(11, CALL_MODE_DIRECT_CHANGE);
 
+      // mirror state (preset id semantics)
+      current.flags      = (bri > 0) ? 1 : 0; // TODO: handle ON/OFF properly // use flags
+      current.presetId     = 11;
+      current.brightness = bri;
+
       sendAckTo(h.sender, OPC_SET_GROUP, ACK_OK);
       acted = true;
       DEBUG_PRINTLN(F("[GateLoRa] SET_GROUP -> applied + ACK"));
     } break;
 
-    case OPC_WLED_CONTROL: {
-      LoraProto::P_WledControl p{};
+    case OPC_CONTROL: {
+      // CONFIG (preset + flags) using the legacy 4B P_Control layout.
+      // NOTE: We intentionally do NOT apply the preset immediately if GC_FLAG_ARM_ON_SYNC is set.
+      LoraProto::P_Control p{};
       if (!parseBody(buf, (uint8_t)len, p)) break;
+
       if (!groupMatch(p.groupId)) break;
 
-      applyControl(p);         // fertig
+      handleConfig(p);
       acted = true;
-      DEBUG_PRINTLN(F("[GateLoRa] WLED_CONTROL -> applied"));
+      DEBUG_PRINTLN(F("[GateLoRa] CONTROL -> config received"));
+    } break;
+
+    case OPC_SYNC: {
+      // SYNC packet: [phase16_lo][phase16_hi][bri]
+      LoraProto::P_Sync p{};
+      if (!parseBody(buf, (uint8_t)len, p)) break;
+
+      const uint8_t* b = buf + sizeof(Header7);
+      const uint8_t g = b[0];
+      if (!groupMatch(g)) break;
+
+      bool hasSeq = false;
+      uint8_t seq = 0;
+      uint16_t phase16 = 0;
+      bool hasBri = false;
+      uint8_t briFromPkt = 0;
+
+      if (bodyLen == 3) {
+        // [g][p0][p1]
+        phase16 = (uint16_t)b[1] | ((uint16_t)b[2] << 8);
+      } else {
+        // [g][seq][p0][p1]...
+        hasSeq = true;
+        seq = b[1];
+        phase16 = (uint16_t)b[2] | ((uint16_t)b[3] << 8);
+        if (bodyLen >= 5) {
+          hasBri = true;
+          briFromPkt = b[4];
+        }
+      }
+
+      handleSync(phase16, briFromPkt);
+      acted = true;
+    } break;
+
+    case OPC_CONFIG: {
+      LoraProto::P_Config p{};
+      if (!parseBody(buf, (uint8_t)len, p)) break;
+      //if (!groupMatch(p.groupId)) break;
+      if (LoraLink::isBroadcast3(h.receiver)) return;  // only unicast allowed for config
+
+      if (p.option == 0x01) { // MAC Filter Enable/Disable
+        macFilterEnabled = (p.flags != 0);
+      } else if (p.option == 0x02) { // Clear learned Master
+        clearMaster();
+      } else if (p.option == 0x03) { // MAC Filter Persist Enable/Disable
+        macFilterPersist = (p.flags != 0);
+      } else if (p.option == 0x04) { // Enable AP Mode
+        if (p.flags != 0) WLED::instance().initAP(true);
+        else {
+          dnsServer.stop();
+          WiFi.softAPdisconnect(true);
+          apActive = false;
+        }
+      } else if (p.option == 0x05) { // Reboot Node
+        if (p.flags != 0) doReboot = true;
+      }
+      else {
+        // unknown option
+        break;
+      }
+      acted = true;
+      DEBUG_PRINTLN(F("[GateLoRa] CONFIG -> applied"));
     } break;
 
     case OPC_STATUS: { // GET_STATUS -> STATUS_REPLY
@@ -450,8 +546,8 @@ void UsermodGateControlLoRa::sendStatusReplyTo(const uint8_t destLast3[3]) {
   uint8_t out[32];
 
   P_StatusReply p{};
-  p.state      = current.state;
-  p.effect     = current.effect;
+  p.flags      = current.flags;
+  p.presetId     = current.presetId;
   p.brightness = current.brightness;
   p.vbat_mV  = 0;
 
@@ -490,12 +586,174 @@ void UsermodGateControlLoRa::sendStatusReplyTo(const uint8_t destLast3[3]) {
   //LoraLink::scheduleSend(ll, out, n, 50, 2500);
 }
 
+// ===================== WLED preset-sync implementation =====================
+
+static inline uint32_t unwrap16_to32(uint16_t v16, uint32_t last32) {
+  // Choose the 16-bit wrapped value that is closest to last32.
+  uint32_t base = last32 & 0xFFFF0000UL;
+  uint32_t cand = base | (uint32_t)v16;
+  // If cand is more than half-range behind/ahead, wrap.
+  if (cand + 0x8000UL < last32) cand += 0x10000UL;
+  else if (cand > last32 + 0x8000UL) cand -= 0x10000UL;
+  return cand;
+}
+
+static inline int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+void UsermodGateControlLoRa::handleConfig(const GateCore& cfg) {
+  // cfg fields mapping (see header): groupId, flags(state), presetId(effect), bri(brightness)
+  pending.presetId = cfg.presetId;
+  pending.flags    = cfg.flags;
+  pending.bri      = cfg.brightness;
+  pending.rxAtMs   = millis();
+
+  // Default behavior: wait for next SYNC before applying.
+  pending.armed = (pending.flags & GC_FLAG_ARM_ON_SYNC) != 0;
+
+  // If master explicitly does NOT want to wait for SYNC, apply immediately (not time-aligned).
+  if (!pending.armed) {
+    GateCore in = cfg;
+    // interpret flags: bit0 = power
+    uint8_t outBri = (pending.flags & GC_FLAG_HAS_BRI) ? pending.bri : (uint8_t)bri;
+    if (!(pending.flags & GC_FLAG_POWER_ON)) outBri = 0;
+    in.flags = (outBri > 0) ? 1 : 0;
+    in.brightness = outBri;
+    applyControl(in);
+  }
+
+  // Optionally learn master on first meaningful packet (keeps old behavior: discovery/grouping)
+  // (Master learning is handled earlier in handlePacket for SET_GROUP; keep this only if desired)
+}
+
+void UsermodGateControlLoRa::handleSync(uint16_t phase16, uint8_t briFromPkt) {
+  const uint32_t nowLocalMs = millis();
+
+  // Convert compact phase to unwrapped ms
+  // phase16 counts GC_SYNC_TICK_MS ticks
+  uint32_t phaseTicks32 = 0;
+  if (!haveSync) {
+    phaseTicks32 = (uint32_t)phase16;
+  } else {
+    // unwrap in tick-domain, then convert to ms
+    const uint32_t lastTicks32 = lastPhaseMs / GC_SYNC_TICK_MS;
+    phaseTicks32 = unwrap16_to32(phase16, lastTicks32);
+  }
+  const uint32_t phaseMs32 = phaseTicks32 * (uint32_t)GC_SYNC_TICK_MS;
+
+  // Compute desired WLED effect timebase so that (millis() + strip.timebase) == phaseMs32
+  // WLED uses (millis() + strip.timebase) as the effect 'now' reference.
+  // timebase is uint32; subtraction wrap is fine.
+  const uint32_t desiredTimebase = (uint32_t)(phaseMs32 - nowLocalMs);
+
+  bool hardSet = false;
+  if (!haveSync || pending.armed) {
+    hardSet = true;
+  } else {
+    // If sync interval is very long, do a hard set (unwrap ambiguity risk)
+    uint32_t dt = nowLocalMs - lastSyncLocalMs;
+    if (dt > 300000UL) { // >5 min
+      hardSet = true;
+    }
+  }
+
+  if (hardSet) {
+    strip.timebase = desiredTimebase;
+  } else {
+    // Slew-limited correction to avoid visible jumps from packet jitter
+    int32_t err = (int32_t)(desiredTimebase - strip.timebase);
+    if (err > (int32_t)GC_SYNC_HARD_RESYNC_MS || err < -(int32_t)GC_SYNC_HARD_RESYNC_MS) {
+      strip.timebase = desiredTimebase;
+    } else {
+      int32_t step = clamp_i32(err, -(int32_t)GC_SYNC_MAX_STEP_MS, (int32_t)GC_SYNC_MAX_STEP_MS);
+      strip.timebase = (uint32_t)((int32_t)strip.timebase + step);
+    }
+  }
+
+  // Start the armed preset exactly on the first SYNC after CONFIG
+  if (pending.armed) {
+    const uint8_t flags = pending.flags;
+
+    // Optionally force transition delay to 0 for this start.
+    // This avoids unsynced crossfades.
+    uint16_t oldTransition = transitionDelay;
+    if (flags & GC_FLAG_FORCE_TT0) {
+      transitionDelay = 0;
+    }
+
+    // Decide whether to apply even if already active
+    bool needApply = true;
+    if (!(flags & GC_FLAG_FORCE_REAPPLY)) {
+      if (current.presetId == pending.presetId && current.flags == ((flags & GC_FLAG_POWER_ON) ? 1 : 0)) {
+        needApply = false;
+      }
+    }
+
+    // Apply preset (RX-only; do not notify)
+    if (needApply) {
+      applyPreset(pending.presetId, CALL_MODE_NO_NOTIFY);
+    }
+
+    // Brightness handling
+    uint8_t outBri = bri;
+    if (flags & GC_FLAG_HAS_BRI) { // config packet specified a brightness
+      outBri = pending.bri; // use that
+    }
+    else {
+      outBri = briFromPkt; // use SYNC packet brightness
+    }
+    if (!(flags & GC_FLAG_POWER_ON)) { // power on flag not set
+      outBri = 0;
+    }
+    bri = outBri;
+
+    // Pull changes through without causing UDP notifications
+    stateUpdated(CALL_MODE_NO_NOTIFY);
+
+    // Restore transition delay
+    if (flags & GC_FLAG_FORCE_TT0) {
+      transitionDelay = oldTransition;
+    }
+
+    // Update current mirror
+    //current.groupId    = current.groupId; // unchanged
+    current.flags      = (outBri > 0) ? 1 : 0;
+    current.presetId   = pending.presetId;
+    current.brightness = outBri;
+
+    pending.armed = false;
+  } else {
+    // Optional: allow live brightness via SYNC packet without restarting the preset
+    if (!(pending.flags & GC_FLAG_HAS_BRI)) { // only if CONFIG did not specify a brightness
+      if (bri != briFromPkt) {
+        bri = briFromPkt;
+        stateUpdated(CALL_MODE_NO_NOTIFY);
+        current.brightness = briFromPkt;
+        current.flags = (briFromPkt > 0) ? 1 : 0;
+      }
+    }
+  }
+
+  // Store sync history
+  haveSync = true;
+  lastPhaseMs = phaseMs32;
+  lastSyncLocalMs = nowLocalMs;
+}
+
 // ========= Apply CONTROL =========
 void UsermodGateControlLoRa::applyControl(const GateCore& in) {
   // state -> on/off via brightness, effect -> preset id, brightness direct
-  bri = (in.state > 0) ? in.brightness : 0;
-  applyPreset(in.effect);                    // setzt das WLED-Preset
-  stateUpdated(CALL_MODE_DIRECT_CHANGE);     // zieht die Helligkeit
+  bri = (in.flags > 0) ? in.brightness : 0;
+  applyPreset(in.presetId, CALL_MODE_NO_NOTIFY);  // RX-only: no UDP/WiFi notify
+  
+  //effectPalette += 1;
+  //if (effectPalette <= 50) effectPalette = in.palette;
+  //colorUpdated(CALL_MODE_FX_CHANGED);
+  
+  stateUpdated(CALL_MODE_NO_NOTIFY);
 
   current = in;                              // DIREKTE Übernahme statt Feld-für-Feld
   // mirror current state

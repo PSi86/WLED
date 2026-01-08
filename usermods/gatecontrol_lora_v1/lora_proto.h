@@ -12,7 +12,7 @@ namespace LoraProto {
 
 // -------------------- Versioning --------------------
 static const uint8_t PROTO_VER_MAJOR = 1;
-static const uint8_t PROTO_VER_MINOR = 1;
+static const uint8_t PROTO_VER_MINOR = 2;
 
 // -------------------- Direction/Type helpers --------------------
 static const uint8_t DIR_M2N = 0x00;  // Master -> Node
@@ -36,8 +36,10 @@ struct __attribute__((packed)) Header7 {
 enum Opcode7 : uint8_t {
   OPC_DEVICES       = 0x01, // GET_DEVICES (M2N) / IDENTIFY_REPLY (N2M)
   OPC_SET_GROUP     = 0x02, // SET_GROUP (M2N)
-  OPC_WLED_CONTROL  = 0x03, // WLED_CONTROL (M2N)
-  OPC_STATUS        = 0x04, // GET_STATUS (M2N) / STATUS_REPLY (N2M)
+  OPC_STATUS        = 0x03, // GET_STATUS (M2N) / STATUS_REPLY (N2M)
+  OPC_CONTROL       = 0x04, // CONTROL (M2N)
+  OPC_CONFIG        = 0x05, // CONFIG (M2N)
+  OPC_SYNC          = 0x06, // SYNC Pulse (M2N)
   OPC_ACK           = 0x7E, // ACK (both directions, as response only)
   // (optional future: 0x05 STATUS_UPDATE N2M unrequested telemetry)
 };
@@ -45,21 +47,24 @@ enum Opcode7 : uint8_t {
 // -------------------- Payloads --------------------
 // Master -> Node
 struct __attribute__((packed)) P_GetDevices  { uint8_t groupId; uint8_t flags;        }; // 2B
-struct __attribute__((packed)) P_WledControl { uint8_t groupId; uint8_t state; uint8_t effect; uint8_t brightness; }; // 4B
-struct __attribute__((packed)) P_SetGroup    { uint8_t groupId;                        }; // 1B
+struct __attribute__((packed)) P_SetGroup    { uint8_t groupId;                       }; // 1B
 struct __attribute__((packed)) P_GetStatus   { uint8_t groupId; uint8_t flags;        }; // 2B
+struct __attribute__((packed)) P_Control     { uint8_t groupId; uint8_t flags; uint8_t presetId; uint8_t brightness; }; // 4B // add palette later?
+struct __attribute__((packed)) P_Config      { uint8_t option; uint8_t flags;         }; // 2B
+struct __attribute__((packed)) P_Sync        { uint8_t phase16_lo;  uint8_t phase16_hi; uint8_t brightness;      }; // 3B
 
 // Node -> Master
 //struct __attribute__((packed)) P_IdentifyReply { uint8_t proto_ver_major; uint8_t proto_ver_minor; uint8_t caps; uint8_t groupId; uint8_t mac6[6]; }; // 10B
 struct __attribute__((packed)) P_IdentifyReply { uint8_t fw; uint8_t caps; uint8_t groupId; uint8_t mac6[6]; }; // 10B // fw, caps, groupId, mac6[6] // 9B
 //struct __attribute__((packed)) P_StatusReply   { uint8_t fw_major; uint8_t fw_minor; uint8_t fw_patch; uint16_t vbat_mV; int8_t rssi; int8_t snr; };   // 7B
-struct __attribute__((packed)) P_StatusReply   { uint8_t state; uint8_t effect; uint8_t brightness; uint16_t vbat_mV; int8_t rssi; int8_t snr; };   // 7B
+struct __attribute__((packed)) P_StatusReply   { uint8_t flags; uint8_t presetId; uint8_t brightness; uint16_t vbat_mV; int8_t rssi; int8_t snr; };   // 7B
 
 // ACK (both directions, response only)
 enum AckStatus : uint8_t { ACK_OK=0, ACK_BAD_TYPE=1, ACK_BAD_LEN=2, ACK_UNAUTHORIZED=3, ACK_BUSY=4, ACK_ERROR=5 };
 struct __attribute__((packed)) P_Ack { uint8_t echo_opcode7; uint8_t status; uint8_t seq; }; // seq currently 0
 
-static_assert(sizeof(P_WledControl) <= BODY_MAX, "P_WledControl too large");
+static_assert(sizeof(P_Control) <= BODY_MAX, "P_Control too large");
+static_assert(sizeof(P_Config) <= BODY_MAX, "P_Config too large");
 static_assert(sizeof(P_IdentifyReply) <= BODY_MAX, "P_IdentifyReply too large");
 static_assert(sizeof(P_StatusReply) <= BODY_MAX, "P_StatusReply too large");
 static_assert(sizeof(P_Ack) <= BODY_MAX, "P_Ack too large");
@@ -83,11 +88,13 @@ template<typename T> constexpr uint8_t SZ() { return (uint8_t)sizeof(T); }
 // Rules (keep small and constexpr-friendly)
 static constexpr PacketRule RULES[] = {
   // OPC_DEVICES: GET_DEVICES (M2N, 2B) -> IDENTIFY_REPLY (N2M, 10B)
-  { OPC_DEVICES,      DIR_M2N, RESP_SPECIFIC, OPC_DEVICES, SZ<P_GetDevices>(),  SZ<P_IdentifyReply>(), "DEVICES/IDENTIFY" },
-  // OPC_WLED_CONTROL: WLED_CONTROL (M2N, 4B) -> no response
-  { OPC_WLED_CONTROL, DIR_M2N, RESP_NONE,     0,            SZ<P_WledControl>(), 0,                      "WLED_CONTROL" },
+  { OPC_DEVICES,      DIR_M2N, RESP_SPECIFIC, OPC_DEVICES, SZ<P_GetDevices>(),  SZ<P_IdentifyReply>(),   "DEVICES/IDENTIFY" },
+  // OPC_CONTROL: CONTROL (M2N, 4B) -> no response
+  { OPC_CONTROL,      DIR_M2N, RESP_NONE,     0,           SZ<P_Control>(),  0,                     "CONTROL" },
   // SET_GROUP (M2N, 1B) -> ACK
   { OPC_SET_GROUP,    DIR_M2N, RESP_ACK,      OPC_ACK,      SZ<P_SetGroup>(),     SZ<P_Ack>(),           "SET_GROUP" },
+  // CONFIG (M2N, 2B) -> ACK
+  { OPC_CONFIG,       DIR_M2N, RESP_ACK,      OPC_ACK,      SZ<P_Config>(),       SZ<P_Ack>(),           "CONFIG" },
   // OPC_STATUS: GET_STATUS (M2N, 2B) -> STATUS_REPLY (N2M, 7B)
   { OPC_STATUS,       DIR_M2N, RESP_SPECIFIC, OPC_STATUS,   SZ<P_GetStatus>(),    SZ<P_StatusReply>(),   "STATUS" },
 };
