@@ -13,7 +13,7 @@ extern "C" {
 }
 
 #define FW_VERSION 2 // Version of the GateControlLoRa firmware
-using GateCore = LoraProto::P_Control;  // 4B: groupId, state, effect, brightness // Define control packet type for this device
+using GateCore = LoraProto::P_Control;  // 4B: groupId, flags, presetId, brightness
 
 // ===================== WLED Sync over LoRa =====================
 //
@@ -49,15 +49,15 @@ using GateCore = LoraProto::P_Control;  // 4B: groupId, state, effect, brightnes
 
 // CONFIG packet uses the existing 4B P_Control layout, but interprets the fields as:
 //   groupId    : group selector
-//   state      : flags bitfield (see below)
-//   effect     : presetId (1..250)
+//   flags      : flags bitfield (see below)
+//   presetId   : presetId (1..250)
 //   brightness : brightness (0..255)
 //
-// Bitfield for CONFIG.flags (stored in P_WledControl.state)
+// Bitfield for CONFIG.flags (stored in P_Control.flags)
 enum GateCfgFlags : uint8_t {
   GC_FLAG_POWER_ON        = 1u << 0,  // desired power state (1=on). If 0 -> bri forced to 0 on start.
   GC_FLAG_ARM_ON_SYNC     = 1u << 1,  // if set: do not apply preset until first SYNC arrives
-  GC_FLAG_HAS_BRI         = 1u << 2,  // if set: use brightness byte from CONFIG/SYNC
+  GC_FLAG_HAS_BRI         = 1u << 2,  // if set: CONFIG includes explicit brightness; if not set: brightness may come from SYNC (live)
   GC_FLAG_FORCE_TT0       = 1u << 3,  // if set: force transition delay to 0 when starting the preset
   GC_FLAG_FORCE_REAPPLY   = 1u << 4,  // if set: re-apply preset even if it's already active
 };
@@ -155,12 +155,13 @@ private:
     uint32_t rxAtMs = 0;         // when CONFIG was received
   } pending;
 
+  bool haveControl = false;   // set true after first CONTROL/CONFIG packet
+
   // last received SYNC phase (for unwrap/filter)
   bool     haveSync = false;
   uint32_t lastPhaseMs = 0;      // unwrapped master phase in ms (derived from phase16 * GC_SYNC_TICK_MS)
   uint32_t lastSyncLocalMs = 0;  // local millis() when last SYNC was processed
-  uint8_t  lastSeq = 0;
-  bool     haveSeq = false;
+  int32_t  lastSyncTbErrMs = 0;   // last timebase error (for debug/info)
 
   // Master filter options
   bool macFilterEnabled = true;   // default: ON
@@ -208,8 +209,8 @@ private:
 /*   void buildCoreFromCurrent(GateCore& out) {
     out.deviceType = THIS_TYPE;
     out.groupId    = current.groupId;
-    out.state      = current.state;
-    out.effect     = current.effect;
+    out.flags     = current.flags;
+    out.presetId  = current.presetId;
     out.brightness = current.brightness;
   } */
   void buildCoreFromCurrent(GateCore& out) { out = current; }  // oder komplett entfernen TODO: noch nötig?
