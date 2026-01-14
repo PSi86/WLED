@@ -36,25 +36,6 @@ static inline void captureLastRxPacket(const uint8_t* buf, size_t len) {
   else   *p = '\0';
 }
 
-// ======= Flag-Stringifier =======
-static void formatControlFlags(uint8_t flags, char* out, size_t outSize) {
-  if (!out || outSize == 0) return;
-  out[0] = '\0';
-
-  // Power: ON/OFF als erstes (lesbar)
-  if (flags & GC_FLAG_POWER_ON) strlcat(out, "ON", outSize);
-  else                         strlcat(out, "OFF", outSize);
-
-  if (flags & GC_FLAG_ARM_ON_SYNC)   strlcat(out, " ARM", outSize);
-
-  // Quelle für Brightness: aus Config oder aus Sync
-  if (flags & GC_FLAG_HAS_BRI)       strlcat(out, " BriCFG", outSize);
-  else                               strlcat(out, " BriSYNC", outSize);
-
-  if (flags & GC_FLAG_FORCE_TT0)     strlcat(out, " TT0", outSize);
-  if (flags & GC_FLAG_FORCE_REAPPLY) strlcat(out, " RE", outSize);
-}
-
 // ======= um_data_t helpers =======
 template<typename T>
 static inline bool um_read(const um_data_t* d, uint8_t idx, um_types_t expected, T& out) {
@@ -492,13 +473,13 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
       P_Sync p{};
       if (!parseBody(buf, (uint8_t)len, p)) break;
 
-      const uint16_t phase16 = (uint16_t)p.phase16_lo | ((uint16_t)p.phase16_hi << 8);
-      handleSync(phase16, p.brightness);
+      const uint32_t ts24 = ((uint32_t)p.ts24_0) | ((uint32_t)p.ts24_1 << 8) | ((uint32_t)p.ts24_2 << 16);
+      handleSync(ts24, p.brightness);
       acted = true;
       //DEBUG_PRINTLN(F("[GateLoRa] SYNC -> processed"));
     } break;
 
-case OPC_CONFIG: {
+    case OPC_CONFIG: {
       LoraProto::P_Config p{};
       if (!parseBody(buf, (uint8_t)len, p)) break;
       //if (!groupMatch(p.groupId)) break;
@@ -681,34 +662,36 @@ void UsermodGateControlLoRa::handleConfig(const GateCore& cfg) {
 }
 
 // ========= SYNC handler (global, irregular arrival OK) =========
-void UsermodGateControlLoRa::handleSync(uint16_t phase16, uint8_t briFromPkt) {
+void UsermodGateControlLoRa::handleSync(uint32_t ts24, uint8_t briFromPkt) {
   const uint32_t nowMs = millis();
 
-  // ---- unwrap phase16 (ticks) to monotonic 32-bit ----
-  uint32_t phaseTicks32 = 0;
-  if (!haveSync) {
-    haveSync = true;
-    phaseTicks32 = (uint32_t)phase16;
-  } else {
-    const uint32_t lastTicks32 = (GC_SYNC_TICK_MS > 0) ? (lastPhaseMs / (uint32_t)GC_SYNC_TICK_MS) : 0;
-    const uint32_t dtTicks = (GC_SYNC_TICK_MS > 0) ? ((nowMs - lastSyncLocalMs) / (uint32_t)GC_SYNC_TICK_MS) : 0;
-    const uint32_t pred = lastTicks32 + dtTicks;
+// ---- unwrap 24-bit master timestamp (ms) to monotonic 32-bit ----
+uint32_t masterAbsMs = 0;
+if (!haveSync) {
+  haveSync = true;
+  masterAbsMs = (ts24 & 0x00FFFFFFUL);
+} else {
+  // Predict master time based on local elapsed time since last SYNC.
+  const uint32_t pred = masterEpochAbsMs + (uint32_t)(nowMs - lastSyncLocalMs);
 
-    uint32_t cand = (pred & 0xFFFF0000UL) | (uint32_t)phase16;
-    if (cand + 0x8000UL < pred) cand += 0x10000UL;
-    else if (cand > pred + 0x8000UL) cand -= 0x10000UL;
+  // Place incoming 24-bit timestamp into the predicted 32-bit window.
+  uint32_t cand = (pred & 0xFF000000UL) | (ts24 & 0x00FFFFFFUL);
 
-    phaseTicks32 = cand;
-  }
+  // Choose nearest wrap (half-range = 2^23 ms ≈ 2.33h).
+  if (cand + 0x00800000UL < pred) cand += 0x01000000UL;
+  else if (cand > pred + 0x00800000UL) cand -= 0x01000000UL;
 
-  lastPhaseMs = phaseTicks32 * (uint32_t)GC_SYNC_TICK_MS;
-  lastSyncLocalMs = nowMs;
+  masterAbsMs = cand;
+}
+
+masterEpochAbsMs = masterAbsMs;
+lastSyncLocalMs = nowMs;
 
   // ---- compute desired WLED timebase (wrap-safe) ----
-  const uint32_t desiredTb = (uint32_t)(lastPhaseMs - nowMs);
+  const uint32_t desiredTb = (uint32_t)(masterEpochAbsMs - nowMs);
 
   const int32_t err = (int32_t)(desiredTb - (uint32_t)strip.timebase);
-  lastSyncTbErrMs = err; // for debug/info
+  lastSyncTbErrMs = err; // debug/info
   const uint32_t aerr = (err < 0) ? (uint32_t)(-err) : (uint32_t)err;
 
   const bool hard = pending.armed || (aerr > (uint32_t)GC_SYNC_HARD_RESYNC_MS);

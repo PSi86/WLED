@@ -12,7 +12,7 @@ namespace LoraProto {
 
 // -------------------- Versioning --------------------
 static const uint8_t PROTO_VER_MAJOR = 1;
-static const uint8_t PROTO_VER_MINOR = 2;
+static const uint8_t PROTO_VER_MINOR = 3;
 
 // -------------------- Direction/Type helpers --------------------
 static const uint8_t DIR_M2N = 0x00;  // Master -> Node
@@ -51,7 +51,7 @@ struct __attribute__((packed)) P_SetGroup    { uint8_t groupId;                 
 struct __attribute__((packed)) P_GetStatus   { uint8_t groupId; uint8_t flags;        }; // 2B
 struct __attribute__((packed)) P_Control     { uint8_t groupId; uint8_t flags; uint8_t presetId; uint8_t brightness; }; // 4B // add palette later?
 struct __attribute__((packed)) P_Config      { uint8_t option; uint8_t flags;         }; // 2B
-struct __attribute__((packed)) P_Sync        { uint8_t phase16_lo;  uint8_t phase16_hi; uint8_t brightness;      }; // 3B
+struct __attribute__((packed)) P_Sync        { uint8_t ts24_0; uint8_t ts24_1; uint8_t ts24_2; uint8_t brightness; }; // 4B // 24-bit timestamp LSB first + bri
 
 // Node -> Master
 //struct __attribute__((packed)) P_IdentifyReply { uint8_t proto_ver_major; uint8_t proto_ver_minor; uint8_t caps; uint8_t groupId; uint8_t mac6[6]; }; // 10B
@@ -65,6 +65,7 @@ struct __attribute__((packed)) P_Ack { uint8_t echo_opcode7; uint8_t status; uin
 
 static_assert(sizeof(P_Control) <= BODY_MAX, "P_Control too large");
 static_assert(sizeof(P_Config) <= BODY_MAX, "P_Config too large");
+static_assert(sizeof(P_Sync) <= BODY_MAX, "P_Sync too large");
 static_assert(sizeof(P_IdentifyReply) <= BODY_MAX, "P_IdentifyReply too large");
 static_assert(sizeof(P_StatusReply) <= BODY_MAX, "P_StatusReply too large");
 static_assert(sizeof(P_Ack) <= BODY_MAX, "P_Ack too large");
@@ -88,15 +89,17 @@ template<typename T> constexpr uint8_t SZ() { return (uint8_t)sizeof(T); }
 // Rules (keep small and constexpr-friendly)
 static constexpr PacketRule RULES[] = {
   // OPC_DEVICES: GET_DEVICES (M2N, 2B) -> IDENTIFY_REPLY (N2M, 10B)
-  { OPC_DEVICES,      DIR_M2N, RESP_SPECIFIC, OPC_DEVICES, SZ<P_GetDevices>(),  SZ<P_IdentifyReply>(),   "DEVICES/IDENTIFY" },
-  // OPC_CONTROL: CONTROL (M2N, 4B) -> no response
-  { OPC_CONTROL,      DIR_M2N, RESP_NONE,     0,           SZ<P_Control>(),  0,                     "CONTROL" },
+  { OPC_DEVICES,    DIR_M2N, RESP_SPECIFIC, OPC_DEVICES, SZ<P_GetDevices>(),  SZ<P_IdentifyReply>(), "DEVICES/IDENTIFY" },
   // SET_GROUP (M2N, 1B) -> ACK
-  { OPC_SET_GROUP,    DIR_M2N, RESP_ACK,      OPC_ACK,      SZ<P_SetGroup>(),     SZ<P_Ack>(),           "SET_GROUP" },
-  // CONFIG (M2N, 2B) -> ACK
-  { OPC_CONFIG,       DIR_M2N, RESP_ACK,      OPC_ACK,      SZ<P_Config>(),       SZ<P_Ack>(),           "CONFIG" },
+  { OPC_SET_GROUP,  DIR_M2N, RESP_ACK,      OPC_ACK,     SZ<P_SetGroup>(),    SZ<P_Ack>(),           "SET_GROUP" },
   // OPC_STATUS: GET_STATUS (M2N, 2B) -> STATUS_REPLY (N2M, 7B)
-  { OPC_STATUS,       DIR_M2N, RESP_SPECIFIC, OPC_STATUS,   SZ<P_GetStatus>(),    SZ<P_StatusReply>(),   "STATUS" },
+  { OPC_STATUS,     DIR_M2N, RESP_SPECIFIC, OPC_STATUS,  SZ<P_GetStatus>(),   SZ<P_StatusReply>(),   "STATUS" },
+  // OPC_CONTROL: CONTROL (M2N, 4B) -> no response
+  { OPC_CONTROL,    DIR_M2N, RESP_NONE,     0,           SZ<P_Control>(),     0,                     "CONTROL" },
+  // CONFIG (M2N, 2B) -> ACK
+  { OPC_CONFIG,     DIR_M2N, RESP_ACK,      OPC_ACK,     SZ<P_Config>(),      SZ<P_Ack>(),           "CONFIG" },
+  // OPC_SYNC: SYNC (M2N, 3B) -> no response
+  { OPC_SYNC,       DIR_M2N, RESP_NONE,     0,           SZ<P_Sync>(),        0,                     "SYNC" },
 };
 
 // Lookup by 7-bit opcode

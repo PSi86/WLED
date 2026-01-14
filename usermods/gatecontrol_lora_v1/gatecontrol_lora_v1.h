@@ -19,18 +19,13 @@ using GateCore = LoraProto::P_Control;  // 4B: groupId, flags, presetId, brightn
 //
 // Preset-based, RX-only nodes:
 // - CONFIG packet: arm preset + optional flags/brightness, but DO NOT start rendering yet.
-// - SYNC packet: carries a compact 16-bit phase/timebase from master. On first SYNC after CONFIG
+// - SYNC packet: carries a compact 24-bit millisecond timestamp from master. On first SYNC after CONFIG
 //   the node applies the pending preset and aligns WLED's effect timebase. Subsequent SYNC packets
 //   only adjust the timebase (optionally slew-limited) to keep effects in phase even if SYNC
 //   arrives irregularly.
 //
 // Important: The numeric opcode for SYNC must match your master implementation.
 // If your protocol header already defines OPC_SYNC, that value will be used.
-
-// Phase tick resolution in the SYNC packet (phase16 counts these ticks)
-#ifndef GC_SYNC_TICK_MS
-  #define GC_SYNC_TICK_MS 10
-#endif
 
 // Slew limit for timebase correction (ms per received SYNC). Keeps visual jitter <~50ms.
 #ifndef GC_SYNC_MAX_STEP_MS
@@ -159,9 +154,9 @@ private:
 
   // last received SYNC phase (for unwrap/filter)
   bool     haveSync = false;
-  uint32_t lastPhaseMs = 0;      // unwrapped master phase in ms (derived from phase16 * GC_SYNC_TICK_MS)
+  uint32_t masterEpochAbsMs = 0; // unwrapped master timestamp in ms (32-bit, derived from 24-bit ts24)
   uint32_t lastSyncLocalMs = 0;  // local millis() when last SYNC was processed
-  int32_t  lastSyncTbErrMs = 0;   // last timebase error (for debug/info)
+  int32_t  lastSyncTbErrMs = 0;  // last timebase error (desiredTb - strip.timebase) in ms (debug)
 
   // Master filter options
   bool macFilterEnabled = true;   // default: ON
@@ -220,5 +215,5 @@ private:
 
   // New preset-sync handlers
   void handleConfig(const GateCore& cfg);
-  void handleSync(uint16_t phase16, uint8_t briFromPkt);
+  void handleSync(uint32_t ts24, uint8_t briFromPkt);
 };

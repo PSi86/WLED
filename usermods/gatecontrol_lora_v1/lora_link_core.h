@@ -297,7 +297,6 @@ inline bool scheduleSend(Core& ll, const uint8_t* buf, uint8_t len, uint16_t jit
   } 
   else {
     if (jitterMaxMs == 0) {
-      // use jitterMinMs as fixed delay, even when jitterMaxMs=0
       ll.earliestTxAtMs += 0; // no delay
     }
     else if (jitterMaxMs > jitterMinMs) {
