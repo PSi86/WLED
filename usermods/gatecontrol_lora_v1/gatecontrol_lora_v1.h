@@ -57,6 +57,13 @@ enum GateCfgFlags : uint8_t {
   GC_FLAG_FORCE_REAPPLY   = 1u << 4,  // if set: re-apply preset even if it's already active
 };
 
+// StatusReply config byte flags
+enum GateStatusCfgFlags : uint8_t {
+  GC_CFG_MAC_FILTER_ENABLED  = 1u << 0,
+  GC_CFG_MAC_FILTER_PERSIST  = 1u << 1,
+  GC_CFG_AP_ACTIVE           = 1u << 2,
+};
+
 // README WLAN Behaviour in WLED
 // wled.h (~Line 380):  WLED_GLOBAL byte apBehavior      _INIT(AP_BEHAVIOR_BUTTON_ONLY); // modified for WLED LoRa Gates
 // wled.h (~Line 380):  WLED_GLOBAL byte apBehavior      _INIT(AP_BEHAVIOR_BOOT_NO_CONN); // Original for ESP32
@@ -125,6 +132,10 @@ public:
   uint16_t getId() override { return USERMOD_ID_UNSPECIFIED; }
 
 private:
+  static constexpr uint8_t STREAM_BUFFER_SIZE = 128;
+  static constexpr uint8_t STREAM_CHUNK_SIZE = 8;
+  static constexpr uint8_t STREAM_MAX_PACKETS = STREAM_BUFFER_SIZE / STREAM_CHUNK_SIZE;
+
   // Radio / SPI
   SPIClass* spi = &SPI;
   SX1262* radio = nullptr;
@@ -216,4 +227,11 @@ private:
   // New preset-sync handlers
   void handleConfig(const GateCore& cfg);
   void handleSync(uint32_t ts24, uint8_t briFromPkt);
+
+  bool handleStreamPacket(const uint8_t* buf, uint8_t len, const uint8_t senderLast3[3]);
+
+  uint8_t streamBuffer[STREAM_BUFFER_SIZE] = {0};
+  uint8_t streamReceivedMask = 0;
+  uint8_t streamTotalPackets = 0;
+  uint16_t streamLength = 0;
 };

@@ -399,6 +399,45 @@ void UsermodGateControlLoRa::clearMaster() {
   memset(masterLast3, 0, 3);
 }
 
+bool UsermodGateControlLoRa::handleStreamPacket(const uint8_t* buf, uint8_t len, const uint8_t senderLast3[3]) {
+  using namespace LoraProto;
+  if (len != (sizeof(Header7) + sizeof(P_Stream))) return false;
+
+  const uint8_t* body = buf + sizeof(Header7);
+  const uint8_t ctrl = body[0];
+  const uint8_t totalPackets = (uint8_t)((ctrl >> 4) & 0x0F);
+  const uint8_t packetIndex = (uint8_t)(ctrl & 0x0F);
+
+  if (totalPackets == 0 || totalPackets > STREAM_MAX_PACKETS) return false;
+  if (packetIndex >= totalPackets) return false;
+
+  const uint8_t dataLen = STREAM_CHUNK_SIZE;
+
+  if (packetIndex == 0 || totalPackets != streamTotalPackets) {
+    streamReceivedMask = 0;
+    streamTotalPackets = totalPackets;
+    streamLength = 0;
+  }
+
+  const uint16_t offset = (uint16_t)packetIndex * STREAM_CHUNK_SIZE;
+  if (offset + dataLen > STREAM_BUFFER_SIZE) return false;
+
+  memcpy(streamBuffer + offset, body + 1, dataLen);
+  streamReceivedMask |= (uint8_t)(1u << packetIndex);
+
+  const uint8_t expectedMask = (uint8_t)((1u << totalPackets) - 1u);
+  if (streamReceivedMask == expectedMask) {
+    streamLength = (uint16_t)(totalPackets * STREAM_CHUNK_SIZE);
+    sendAckTo(senderLast3, OPC_STREAM, ACK_OK);
+    streamReceivedMask = 0;
+    streamTotalPackets = 0;
+    streamLength = 0;
+    return true;
+  }
+
+  return false;
+}
+
 void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
   using namespace LoraProto;
 
@@ -486,20 +525,20 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
       if (LoraLink::isBroadcast3(h.receiver)) return;  // only unicast allowed for config
 
       if (p.option == 0x01) { // MAC Filter Enable/Disable
-        macFilterEnabled = (p.flags != 0);
+        macFilterEnabled = (p.data0 != 0);
       } else if (p.option == 0x02) { // Clear learned Master
         clearMaster();
       } else if (p.option == 0x03) { // MAC Filter Persist Enable/Disable
-        macFilterPersist = (p.flags != 0);
+        macFilterPersist = (p.data0 != 0);
       } else if (p.option == 0x04) { // Enable AP Mode
-        if (p.flags != 0) WLED::instance().initAP(true);
+        if (p.data0 != 0) WLED::instance().initAP(true);
         else {
           dnsServer.stop();
           WiFi.softAPdisconnect(true);
           apActive = false;
         }
       } else if (p.option == 0x05) { // Reboot Node
-        if (p.flags != 0) doReboot = true;
+        if (p.data0 != 0) doReboot = true;
       }
       else {
         // unknown option
@@ -517,6 +556,10 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
       sendStatusReplyTo(h.sender);
       acted = true;
       DEBUG_PRINTLN(F("[GateLoRa] GET_STATUS -> STATUS_REPLY"));
+    } break;
+
+    case OPC_STREAM: {
+      acted = handleStreamPacket(buf, (uint8_t)len, h.sender);
     } break;
   }
 
@@ -565,6 +608,11 @@ void UsermodGateControlLoRa::sendStatusReplyTo(const uint8_t destLast3[3]) {
     uint8_t fl = current.flags;
     if (bri > 0) fl |= GC_FLAG_POWER_ON; else fl &= (uint8_t)~GC_FLAG_POWER_ON;
     p.flags      = fl;
+    uint8_t cfg = 0;
+    if (macFilterEnabled) cfg |= GC_CFG_MAC_FILTER_ENABLED;
+    if (macFilterPersist) cfg |= GC_CFG_MAC_FILTER_PERSIST;
+    if (apActive) cfg |= GC_CFG_AP_ACTIVE;
+    p.configByte = cfg;
     p.presetId   = currentPreset;
     p.brightness = bri;
   }
