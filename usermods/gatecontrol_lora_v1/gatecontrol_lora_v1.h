@@ -225,7 +225,7 @@ private:
   void applyControl(const GateCore& in); // legacy immediate apply (kept for compatibility)
 
   // New preset-sync handlers
-  void handleConfig(const GateCore& cfg);
+  void handleControl(const GateCore& cfg);
   void handleSync(uint32_t ts24, uint8_t briFromPkt);
 
   bool handleStreamPacket(const uint8_t* buf, uint8_t len, const uint8_t senderLast3[3]);

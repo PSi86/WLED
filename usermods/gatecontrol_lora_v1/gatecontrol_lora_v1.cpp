@@ -503,7 +503,7 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
       if (!parseBody(buf, (uint8_t)len, p)) break;
       if (!groupMatch(p.groupId)) break;
 
-      handleConfig(p);
+      handleControl(p);
       acted = true;
       DEBUG_PRINTLN(F("[GateLoRa] CONTROL -> configured"));
     } break;
@@ -545,7 +545,8 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
         break;
       }
       acted = true;
-      DEBUG_PRINTLN(F("[GateLoRa] CONFIG -> applied"));
+      sendAckTo(h.sender, OPC_CONFIG, ACK_OK);
+      //DEBUG_PRINTLN(F("[GateLoRa] CONFIG -> applied"));
     } break;
 
     case OPC_STATUS: { // GET_STATUS -> STATUS_REPLY
@@ -673,8 +674,8 @@ void UsermodGateControlLoRa::applyControl(const GateCore& in) {
   haveControl = true;
 }
 
-// ========= CONTROL (CONFIG/ARM) handler =========
-void UsermodGateControlLoRa::handleConfig(const GateCore& cfg) {
+// ========= CONTROL (Preset/Brightness/Flags:ARM, GC_FLAG_FORCE_TT0, etc) handler =========
+void UsermodGateControlLoRa::handleControl(const GateCore& cfg) {
   pending.presetId = cfg.presetId;
   pending.flags    = cfg.flags;
   pending.bri      = cfg.brightness;
