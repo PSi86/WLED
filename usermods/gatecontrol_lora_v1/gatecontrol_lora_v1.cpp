@@ -524,6 +524,9 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
       //if (!groupMatch(p.groupId)) break;
       if (LoraLink::isBroadcast3(h.receiver)) return;  // only unicast allowed for config
 
+      sendAckTo(h.sender, OPC_CONFIG, ACK_OK); // ACK first because some options may take time
+      acted = true;
+
       if (p.option == 0x01) { // MAC Filter Enable/Disable
         macFilterEnabled = (p.data0 != 0);
       } else if (p.option == 0x02) { // Clear learned Master
@@ -537,15 +540,14 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
           WiFi.softAPdisconnect(true);
           apActive = false;
         }
-      } else if (p.option == 0x05) { // Reboot Node
+      } else if (p.option == 0x81) { // Reboot Node
         if (p.data0 != 0) doReboot = true;
       }
       else {
         // unknown option
         break;
       }
-      acted = true;
-      sendAckTo(h.sender, OPC_CONFIG, ACK_OK);
+      
       //DEBUG_PRINTLN(F("[GateLoRa] CONFIG -> applied"));
     } break;
 
