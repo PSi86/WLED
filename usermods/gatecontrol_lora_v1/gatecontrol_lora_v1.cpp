@@ -339,7 +339,14 @@ bool UsermodGateControlLoRa::radioInit() {
   spi->begin(LORA_PIN_SCK, LORA_PIN_MISO, LORA_PIN_MOSI, LORA_PIN_NSS);
 
   // RadioLib Module(cs, dio1, rst, busy, spi)
+  #if defined(GATE_LORA_SX1262)
   static SX1262 r(new Module(LORA_PIN_NSS, LORA_PIN_DIO1, LORA_PIN_RST, LORA_PIN_BUSY, *spi));
+  #elif defined(GATE_LORA_LLCC68)
+  static LLCC68 r(new Module(LORA_PIN_NSS, LORA_PIN_DIO1, LORA_PIN_RST, LORA_PIN_BUSY, *spi));
+  #else
+  #error "No LoRa radio module defined"
+  #endif
+  
   radio = &r;
 
   LoraLink::PhyCfg phy;

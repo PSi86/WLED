@@ -138,7 +138,14 @@ private:
 
   // Radio / SPI
   SPIClass* spi = &SPI;
-  SX1262* radio = nullptr;
+  #if defined(GATE_LORA_SX1262)
+    SX1262* radio = nullptr;
+  #elif defined(GATE_LORA_LLCC68)
+    LLCC68* radio = nullptr;
+  #else
+    #error "No LoRa radio module defined"
+  #endif
+  
 
   //UsermodBattery* bat = nullptr;
   um_data_t* batteryUM = nullptr;
