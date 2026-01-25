@@ -82,6 +82,20 @@ enum class Mode : uint8_t { Idle, Tx, Rx };
 enum class RxKind : uint8_t { None, Timed, Continuous };
 enum class TxArbiter : uint8_t { None, CadNeeded, CadPending };
 
+struct RxRequest {
+  RxKind   kind      = RxKind::None;
+  uint16_t windowMs  = 0;
+  int8_t   numWanted = -1;
+};
+
+struct TxRequest {
+  bool      pending          = false;
+  uint8_t   buf[64];
+  uint8_t   len              = 0;
+  uint32_t  earliestTxAtMs   = 0;
+  TxArbiter arb              = TxArbiter::None;
+};
+
 // -------------------- Core state --------------------
 struct Core {
   
@@ -106,23 +120,16 @@ struct Core {
   // --- RX-Status ---
   RxKind    rxKind            = RxKind::None;   // aktueller RX-Typ (nur wenn rfMode==Rx)
   uint32_t  rxWindowEndMs     = 0;              // nur für RxTimed
-  int8_t    rxNumWanted       = -1;             // Anzahl erwarteter Antworten im Timed-RX (-1=unbegrenzt)
   uint16_t  rxLbtTimeout      = 700;            // nur für RxTimed mit LBT (ms), maximale Zeit zwischen Paketen
   uint16_t  rxCountWinStart   = 0;
 
-  // --- RX-Request (Wunsch) ---
-  RxKind    reqRxKind     = RxKind::None;   // gewünschter RX-Typ
-  uint16_t  reqRxMs       = 0;              // nur wenn reqRxKind==Timed
+  // --- Pending Requests (Wunsch) ---
+  RxRequest pendingRx{};
+  TxRequest pendingTx{};
 
   // --- Default-Modus pro Gerät ---
   RxKind    defaultRxKind = RxKind::None;   // Master: None (Idle), Slave: Continuous
   uint16_t  defaultRxMs   = 500;              // für default Continuous=0 (echt kontinuierlich), für default Timed optional
-
-  // --- TX-Queue ---
-  bool      txPending       = false;
-  uint8_t   txBuf[64];
-  uint8_t   txLen           = 0;
-  uint32_t  earliestTxAtMs  = 0;
 
   // Telemetrie
   int16_t   lastRssi      = 0;
@@ -136,12 +143,13 @@ struct Core {
   // --- LBT / Arbiter / ToA ---
   bool       lbtEnable   = true;                // im Setup setzen
   bool       lbtRxRelax  = true;              // LBT-Backoff (µs)
-  TxArbiter  txArb       = TxArbiter::None;     // LBT-Status
   uint32_t   toaUsMax17  = 0;                   // ToA-Cache (µs) für 17-Byte-Paket // 51ms for 17B @ SF7BW125CR45
 
   uint16_t   debug = 0;
 
 };
+
+using Runtime = Core;
 
 // -------------------- Static ISR trampoline --------------------
 #if defined(ESP32)
@@ -270,32 +278,39 @@ inline uint16_t randMs(Core& ll, uint16_t minMs, uint16_t maxMs) {
   return (uint16_t)r;
 }
 
+inline void applyDefaults(Core& ll) {
+  ll.pendingRx.kind = ll.defaultRxKind;
+  ll.pendingRx.windowMs = ll.defaultRxMs;
+  ll.pendingRx.numWanted = -1;
+}
 // -------------------- RX/TX mode helpers --------------------
 inline void setDefaultIdle(Core& ll) {
   ll.defaultRxKind = RxKind::None;
   ll.defaultRxMs   = 0;
+  applyDefaults(ll);
 }
 inline void setDefaultRxContinuous(Core& ll) {
   ll.defaultRxKind = RxKind::Continuous;
   ll.defaultRxMs   = 0; // echt kontinuierlich
-  ll.reqRxKind = RxKind::Continuous; 
-  ll.reqRxMs = 0;
+  applyDefaults(ll);
 }
 inline void requestRxTimed(Core& ll, uint16_t windowMs, int8_t rxNumWanted = -1) {
-  ll.reqRxKind = RxKind::Timed; 
-  ll.reqRxMs = windowMs;
-  ll.rxNumWanted = rxNumWanted;
+  ll.pendingRx.kind = RxKind::Timed;
+  ll.pendingRx.windowMs = windowMs;
+  ll.pendingRx.numWanted = rxNumWanted;
   ll.changeMode = true; // force window (re)open even if already in Timed RX
 }
 inline void requestRxContinuous(Core& ll) {
-  ll.reqRxKind = RxKind::Continuous; 
-  ll.reqRxMs = 0;
+  ll.pendingRx.kind = RxKind::Continuous;
+  ll.pendingRx.windowMs = 0;
+  ll.pendingRx.numWanted = -1;
 }
 inline void cancelRxRequest(Core& ll) {
   ll.changeMode = true;
   ll.rfMode = Mode::Idle;
-  ll.reqRxKind = RxKind::None; 
-  ll.reqRxMs = 0;
+  ll.pendingRx.kind = RxKind::None;
+  ll.pendingRx.windowMs = 0;
+  ll.pendingRx.numWanted = -1;
 }
 
 // One-slot TX scheduling (returns false if slot busy or oversize).
@@ -304,10 +319,10 @@ inline void cancelRxRequest(Core& ll) {
 // without LBT and jitterMaxMs=0 the TX is scheduled immediately
 inline bool scheduleSend(Core& ll, const uint8_t* buf, uint8_t len, uint16_t jitterMaxMs = 2500) {
 
-  if (ll.txPending || len == 0 || len > sizeof(ll.txBuf)) return false; // Check for pending TX or oversize
-  memcpy(ll.txBuf, buf, len);
-  ll.txLen = len;
-  ll.earliestTxAtMs = millis();
+  if (ll.pendingTx.pending || len == 0 || len > sizeof(ll.pendingTx.buf)) return false; // Check for pending TX or oversize
+  memcpy(ll.pendingTx.buf, buf, len);
+  ll.pendingTx.len = len;
+  ll.pendingTx.earliestTxAtMs = millis();
   
   uint16_t jitterMinMs = 50; // default min jitter
 
@@ -316,24 +331,24 @@ inline bool scheduleSend(Core& ll, const uint8_t* buf, uint8_t len, uint16_t jit
     jitterMaxMs = 300; // fixed max backoff for LBT
     uint16_t randDelayMs = randMs(ll, jitterMinMs, jitterMaxMs);
     //ll.debug = randDelayMs;
-    ll.earliestTxAtMs += randDelayMs;
-    ll.txArb = TxArbiter::CadNeeded;
+    ll.pendingTx.earliestTxAtMs += randDelayMs;
+    ll.pendingTx.arb = TxArbiter::CadNeeded;
   } 
   else {
     if (jitterMaxMs == 0) {
-      ll.earliestTxAtMs += 0; // no delay
+      ll.pendingTx.earliestTxAtMs += 0; // no delay
     }
     else if (jitterMaxMs > jitterMinMs) {
-      ll.earliestTxAtMs += randMs(ll, jitterMinMs, jitterMaxMs);
+      ll.pendingTx.earliestTxAtMs += randMs(ll, jitterMinMs, jitterMaxMs);
     }
     else {
-      ll.earliestTxAtMs += randMs(ll, jitterMinMs, 300); // at least some jitter
+      ll.pendingTx.earliestTxAtMs += randMs(ll, jitterMinMs, 300); // at least some jitter
     }
-    ll.txArb = TxArbiter::None;
+    ll.pendingTx.arb = TxArbiter::None;
   }
 
   ll.debug = 0;
-  ll.txPending = true; // mark TX as pending
+  ll.pendingTx.pending = true; // mark TX as pending
   return true;
 }
 
@@ -371,10 +386,10 @@ inline void service(Core& ll, const Callbacks& cb) {
     if (ll.rfMode == Mode::Rx) {
       size_t len = ll.radio->getPacketLength();
       if (len >= sizeof(LoraProto::Header7)) {
-        // TODO: ab hier nochmal checken! txBuf als maximale länge? -> besser hardcoden
+        // TODO: ab hier nochmal checken! pendingTx.buf als maximale länge? -> besser hardcoden
         // können mehrere pakete im readData buffer enthalten sein?
 
-        if (len > sizeof(ll.txBuf)) len = sizeof(ll.txBuf);
+        if (len > sizeof(ll.pendingTx.buf)) len = sizeof(ll.pendingTx.buf);
         uint8_t pkt[64]; if (len > sizeof(pkt)) len = sizeof(pkt);
         
         if (ll.radio->readData(pkt, len) == RADIOLIB_ERR_NONE) {
@@ -389,7 +404,7 @@ inline void service(Core& ll, const Callbacks& cb) {
           ll.lastRssi = (int16_t)ll.radio->getRSSI(true);
           ll.lastSnr  = (int8_t) ll.radio->getSNR();
 
-          if(ll.rxNumWanted > 0) --ll.rxNumWanted; // nur wenn begrenzte Anzahl erwartet
+          if (ll.pendingRx.numWanted > 0) --ll.pendingRx.numWanted; // nur wenn begrenzte Anzahl erwartet
          
           ++ll.rxCountFiltered;
           ll.lastRxAtMs = now;
@@ -397,7 +412,7 @@ inline void service(Core& ll, const Callbacks& cb) {
         }
       }
       // Rx fortsetzen nicht nötig (nutze immer continuous RX)
-      /* if (!ll.txPending && ll.rxKind != RxKind::None) {
+      /* if (!ll.pendingTx.pending && ll.rxKind != RxKind::None) {
         ll.radio->startReceive(); // nicht nötig, startReceive löst continuous RX aus
       } */
     }
@@ -406,26 +421,26 @@ inline void service(Core& ll, const Callbacks& cb) {
   if(ll.rfMode == Mode::Idle) {
     // Idle → gewünschten Modus prüfen
 
-    if (ll.txPending) {
+    if (ll.pendingTx.pending) {
       // TX steht an
       ll.rfMode = Mode::Tx;
       ll.changeMode = true;
-      //ll.reqRxKind = RxKind::None;
-      //ll.reqRxMs = 0;
+      //ll.pendingRx.kind = RxKind::None;
+      //ll.pendingRx.windowMs = 0;
       return;
     }
-    else if (ll.reqRxKind == RxKind::None && 
-      (ll.reqRxKind != ll.rxKind || ll.changeMode)) {
+    else if (ll.pendingRx.kind == RxKind::None && 
+      (ll.pendingRx.kind != ll.rxKind || ll.changeMode)) {
 
       // kein RX gewünscht, Idle festigen
       ll.radio->standby();
       ll.rxKind = RxKind::None;
       ll.changeMode = false;
-      //ll.reqRxMs = 0; //unnötig
+      //ll.pendingRx.windowMs = 0; //unnötig
       if (cb.onIdle) cb.onIdle(cb.ctx);
       return; // fertig
     }
-    else if (ll.reqRxKind != RxKind::None) {
+    else if (ll.pendingRx.kind != RxKind::None) {
 
       // RX gewünscht
       ll.rfMode = Mode::Rx;
@@ -435,7 +450,7 @@ inline void service(Core& ll, const Callbacks& cb) {
   }
 
   // (B) TX pending starten, wenn sendezeit erreicht, aber kein timed RX läuft
-  //if (ll.txPending && ll.rxKind != RxKind::Timed && (int32_t)(now - ll.earliestTxAtMs) >= 0) {
+  //if (ll.pendingTx.pending && ll.rxKind != RxKind::Timed && (int32_t)(now - ll.pendingTx.earliestTxAtMs) >= 0) {
   if (ll.rfMode == Mode::Tx) {
     
     if (ll.changeMode) {
@@ -444,13 +459,13 @@ inline void service(Core& ll, const Callbacks& cb) {
       if (cb.onTxStart) cb.onTxStart(cb.ctx);
     }
 
-    if((int32_t)(now - ll.earliestTxAtMs) < 0) {
+    if((int32_t)(now - ll.pendingTx.earliestTxAtMs) < 0) {
       return; // noch nicht Zeit zum Senden
     }
 
     // LBT / CAD wenn nötig
-    if (ll.txArb == TxArbiter::CadNeeded) {
-      // zum senden in scheduleSend nur txArb auf CadNeeded und txPending auf true setzen
+    if (ll.pendingTx.arb == TxArbiter::CadNeeded) {
+      // zum senden in scheduleSend nur pendingTx.arb auf CadNeeded und pendingTx.pending auf true setzen
       ChannelScanConfig_t cfg = {
         .cad = {
           .symNum = RADIOLIB_SX126X_CAD_ON_4_SYMB,   // robuste Defaults RADIOLIB_SX126X_CAD_ON_4_SYMB RADIOLIB_SX126X_CAD_ON_2_SYMB // RADIOLIB_SX126X_CAD_PARAM_DEFAULT
@@ -468,23 +483,23 @@ inline void service(Core& ll, const Callbacks& cb) {
       
       if (state != RADIOLIB_CHANNEL_FREE) {
         // busy → kurzen Backoff und erneut CAD wenn Zeit erreicht
-        ll.earliestTxAtMs = now + randMs(ll, 100, 200); // fixed backoff for LBT
-        ll.txArb = TxArbiter::CadNeeded;
+        ll.pendingTx.earliestTxAtMs = now + randMs(ll, 100, 200); // fixed backoff for LBT
+        ll.pendingTx.arb = TxArbiter::CadNeeded;
         ll.debug += 1; // debug counter für busy CAD
         //if(ll.debug <= 2) ll.debug = 2;
         return; // kein weiterer Service jetzt
       }
       else {
-        ll.txArb = TxArbiter::None;
+        ll.pendingTx.arb = TxArbiter::None;
         // weiter zum senden
       }
     }
-    if(ll.txArb == TxArbiter::None) {
+    if (ll.pendingTx.arb == TxArbiter::None) {
       //if (cb.onTxStart) cb.onTxStart(cb.ctx); // schon bei CAD aufrufen?
-      if (ll.radio->transmit(ll.txBuf, ll.txLen) == RADIOLIB_ERR_NONE) {
-        ll.txPending = false;
-        //ll.reqRxKind = ll.defaultRxKind; // nach TX wieder in default RX modus wechseln
-        //ll.reqRxMs   = ll.defaultRxMs;
+      if (ll.radio->transmit(ll.pendingTx.buf, ll.pendingTx.len) == RADIOLIB_ERR_NONE) {
+        ll.pendingTx.pending = false;
+        //ll.pendingRx.kind = ll.defaultRxKind; // nach TX wieder in default RX modus wechseln
+        //ll.pendingRx.windowMs = ll.defaultRxMs;
         
         ++ll.txCount;
         ll.lastTxAtMs = now;
@@ -498,7 +513,7 @@ inline void service(Core& ll, const Callbacks& cb) {
         return; // gesendet, nun platz machen für restlichen code
       }
       else {
-        ll.txArb = TxArbiter::CadNeeded;
+        ll.pendingTx.arb = TxArbiter::CadNeeded;
         return;
       }
     }
@@ -507,14 +522,14 @@ inline void service(Core& ll, const Callbacks& cb) {
   if (ll.rfMode == Mode::Rx) {
     
     // check TX pending (especially for continuous RX)
-    if (ll.txPending) {
+    if (ll.pendingTx.pending) {
       if (ll.rxKind == RxKind::Timed) {
         const uint16_t delta = ll.rxCountFiltered - ll.rxCountWinStart;
         if (cb.onRxWindowClosed) cb.onRxWindowClosed(delta, cb.ctx);
       }
       ll.rxKind = RxKind::None;
       ll.rxWindowEndMs = 0;
-      ll.rxNumWanted = -1;
+      ll.pendingRx.numWanted = -1;
       ll.rfMode = Mode::Idle; // Wechsel zu Tx ermöglichen
       ll.radio->standby(); // Empfang sofort beenden, nicht erst wenn earliestTxAtMs erreicht ist
       ll.changeMode = true;
@@ -525,12 +540,12 @@ inline void service(Core& ll, const Callbacks& cb) {
     if (ll.rxKind == RxKind::Timed && ll.rxWindowEndMs > 0) {
       // RX-Timed: laufendes Fenster -> Fensterende prüfen
       
-      if ((int32_t)(now - ll.rxWindowEndMs) >= 0 || ll.rxNumWanted == 0) {
+      if ((int32_t)(now - ll.rxWindowEndMs) >= 0 || ll.pendingRx.numWanted == 0) {
         // Fensterende erreicht oder alle Antworten empfangen
 
-        if(ll.lbtRxRelax && ll.rxNumWanted != 0) {
+        if (ll.lbtRxRelax && ll.pendingRx.numWanted != 0) {
           // LBT Rx-Relax: RX fortsetzen bis seit dem letzten Paket länger als rxLbtTimeout ms vergangen sind
-          // Ausnahme: wenn rxNumWanted==0 (alle Antworten empfangen)
+          // Ausnahme: wenn pendingRx.numWanted==0 (alle Antworten empfangen)
           const uint32_t deltaSinceLastRx = now - ll.lastRxAtMs;
           if (deltaSinceLastRx < ll.rxLbtTimeout) {
             // noch nicht timeout
@@ -539,11 +554,10 @@ inline void service(Core& ll, const Callbacks& cb) {
         }
 
         ll.rfMode = Mode::Idle;
-        ll.reqRxKind = ll.defaultRxKind; // nach RX wieder in default modus wechseln
-        ll.reqRxMs   = ll.defaultRxMs;
+        applyDefaults(ll); // nach RX wieder in default modus wechseln
         ll.changeMode = true;
         ll.rxWindowEndMs = 0;
-        ll.rxNumWanted = -1;
+        ll.pendingRx.numWanted = -1;
         
         const uint16_t delta = ll.rxCountFiltered - ll.rxCountWinStart;
         if (cb.onRxWindowClosed) cb.onRxWindowClosed(delta, cb.ctx);
@@ -562,22 +576,22 @@ inline void service(Core& ll, const Callbacks& cb) {
       }
     }
 
-    if (ll.changeMode || ll.rxKind != ll.reqRxKind) {
+    if (ll.changeMode || ll.rxKind != ll.pendingRx.kind) {
       // von einem rx modus in einen anderen wechseln
 
-      if(ll.reqRxKind==RxKind::Timed) {
-        // setze rxWindowEndMs reqRxMs
+      if (ll.pendingRx.kind == RxKind::Timed) {
+        // setze rxWindowEndMs pendingRx.windowMs
         // bei LBT automatisch kürzeres rxWindow? -> bei scheduleSend entsprechend anpassen
         ll.rxCountWinStart = ll.rxCountFiltered;
-        const uint16_t w = (ll.reqRxMs ? ll.reqRxMs : ll.defaultRxMs);
+        const uint16_t w = (ll.pendingRx.windowMs ? ll.pendingRx.windowMs : ll.defaultRxMs);
         ll.rxWindowEndMs = now + w;
         if (cb.onRxWindowOpen) cb.onRxWindowOpen(w, cb.ctx);
       }
-      else if(ll.reqRxKind==RxKind::Continuous) {
+      else if (ll.pendingRx.kind == RxKind::Continuous) {
         ll.rxWindowEndMs = 0;
         if (cb.onRxWindowOpen) cb.onRxWindowOpen(0, cb.ctx);
       }
-      ll.rxKind = ll.reqRxKind; // nach übernahme des neuen modus setzen
+      ll.rxKind = ll.pendingRx.kind; // nach übernahme des neuen modus setzen
       ll.changeMode = false; // mode change done
     }
   }
