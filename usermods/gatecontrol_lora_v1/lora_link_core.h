@@ -84,62 +84,68 @@ enum class TxArbiter : uint8_t { None, CadNeeded, CadPending };
 
 // -------------------- Core state --------------------
 struct Core {
-  
-  #if defined(GATE_LORA_SX1262)
-    SX1262*   radio             = nullptr;
-  #elif defined(GATE_LORA_LLCC68)
-    LLCC68*   radio             = nullptr;
-  #else
-    #error "No LoRa radio module defined"
-  #endif
-  
-  volatile bool dio1Flag      = false;
-  volatile uint32_t irqFlags  = 0;
+  struct Config {
+    #if defined(GATE_LORA_SX1262)
+      SX1262*   radio             = nullptr;
+    #elif defined(GATE_LORA_LLCC68)
+      LLCC68*   radio             = nullptr;
+    #else
+      #error "No LoRa radio module defined"
+    #endif
 
-  uint8_t   myMac6[6]     = {0};            // eigene MAC-Adresse (EFUSE)  
-  uint8_t   myLast3[3]    = {0};
-  bool      macReadOK     = false;
+    // --- Default-Modus pro Gerät ---
+    RxKind    defaultRxKind = RxKind::None;   // Master: None (Idle), Slave: Continuous
+    uint16_t  defaultRxMs   = 500;              // für default Continuous=0 (echt kontinuierlich), für default Timed optional
 
-  Mode      rfMode       = Mode::Idle;     // Idle, Tx, Rx
-  bool      changeMode    = true;           // apply initial mode on first service() call
+    // --- LBT / Arbiter / ToA ---
+    bool       lbtEnable   = true;                // im Setup setzen
+    bool       lbtRxRelax  = true;              // LBT-Backoff (µs)
+    uint16_t  rxLbtTimeout      = 700;            // nur für RxTimed mit LBT (ms), maximale Zeit zwischen Paketen
+  } config;
 
-  // --- RX-Status ---
-  RxKind    rxKind            = RxKind::None;   // aktueller RX-Typ (nur wenn rfMode==Rx)
-  uint32_t  rxWindowEndMs     = 0;              // nur für RxTimed
-  int8_t    rxNumWanted       = -1;             // Anzahl erwarteter Antworten im Timed-RX (-1=unbegrenzt)
-  uint16_t  rxLbtTimeout      = 700;            // nur für RxTimed mit LBT (ms), maximale Zeit zwischen Paketen
-  uint16_t  rxCountWinStart   = 0;
+  struct Runtime {
+    volatile bool dio1Flag      = false;
+    volatile uint32_t irqFlags  = 0;
 
-  // --- RX-Request (Wunsch) ---
-  RxKind    reqRxKind     = RxKind::None;   // gewünschter RX-Typ
-  uint16_t  reqRxMs       = 0;              // nur wenn reqRxKind==Timed
+    uint8_t   myMac6[6]     = {0};            // eigene MAC-Adresse (EFUSE)  
+    uint8_t   myLast3[3]    = {0};
+    bool      macReadOK     = false;
 
-  // --- Default-Modus pro Gerät ---
-  RxKind    defaultRxKind = RxKind::None;   // Master: None (Idle), Slave: Continuous
-  uint16_t  defaultRxMs   = 500;              // für default Continuous=0 (echt kontinuierlich), für default Timed optional
+    Mode      rfMode       = Mode::Idle;     // Idle, Tx, Rx
+    bool      changeMode    = true;           // apply initial mode on first service() call
 
-  // --- TX-Queue ---
-  bool      txPending       = false;
-  uint8_t   txBuf[64];
-  uint8_t   txLen           = 0;
-  uint32_t  earliestTxAtMs  = 0;
+    // --- RX-Status ---
+    RxKind    rxKind            = RxKind::None;   // aktueller RX-Typ (nur wenn rfMode==Rx)
+    uint32_t  rxWindowEndMs     = 0;              // nur für RxTimed
+    int8_t    rxNumWanted       = -1;             // Anzahl erwarteter Antworten im Timed-RX (-1=unbegrenzt)
+    uint16_t  rxCountWinStart   = 0;
 
-  // Telemetrie
-  int16_t   lastRssi      = 0;
-  int8_t    lastSnr       = 0;
-  uint16_t  rxCountTotal       = 0;
-  uint16_t  rxCountFiltered    = 0;
-  uint32_t  lastRxAtMs    = 0;
-  uint16_t  txCount       = 0;
-  uint32_t  lastTxAtMs    = 0;
+    // --- RX-Request (Wunsch) ---
+    RxKind    reqRxKind     = RxKind::None;   // gewünschter RX-Typ
+    uint16_t  reqRxMs       = 0;              // nur wenn reqRxKind==Timed
 
-  // --- LBT / Arbiter / ToA ---
-  bool       lbtEnable   = true;                // im Setup setzen
-  bool       lbtRxRelax  = true;              // LBT-Backoff (µs)
-  TxArbiter  txArb       = TxArbiter::None;     // LBT-Status
-  uint32_t   toaUsMax17  = 0;                   // ToA-Cache (µs) für 17-Byte-Paket // 51ms for 17B @ SF7BW125CR45
+    // --- TX-Queue ---
+    bool      txPending       = false;
+    uint8_t   txBuf[64];
+    uint8_t   txLen           = 0;
+    uint32_t  earliestTxAtMs  = 0;
 
-  uint16_t   debug = 0;
+    // --- LBT / Arbiter / ToA ---
+    TxArbiter  txArb       = TxArbiter::None;     // LBT-Status
+    uint32_t   toaUsMax17  = 0;                   // ToA-Cache (µs) für 17-Byte-Paket // 51ms for 17B @ SF7BW125CR45
+
+    uint16_t   debug = 0;
+  } runtime;
+
+  struct Telemetry {
+    int16_t   lastRssi      = 0;
+    int8_t    lastSnr       = 0;
+    uint16_t  rxCountTotal       = 0;
+    uint16_t  rxCountFiltered    = 0;
+    uint32_t  lastRxAtMs    = 0;
+    uint16_t  txCount       = 0;
+    uint32_t  lastTxAtMs    = 0;
+  } telemetry;
 
 };
 
@@ -155,8 +161,8 @@ static Core* volatile g_ll = nullptr;
 
 static void LL_ISR_ATTR onDio1ISR_trampoline() {
   if (g_ll) {
-    g_ll->dio1Flag = true;
-    //g_ll->irqFlags = g_ll->radio->getIrqFlags();
+    g_ll->runtime.dio1Flag = true;
+    //g_ll->runtime.irqFlags = g_ll->config.radio->getIrqFlags();
   }
 }
 
@@ -228,13 +234,13 @@ inline bool beginCommon(LLCC68& radio, Core& ll, const PhyCfg& cfg) {
 
   radio.standby();        // ensure standby after init
 
-  if(readEfuseMac6(ll.myMac6)) {
-    ll.macReadOK = true;
-    last3FromMac6(ll.myLast3, ll.myMac6);
+  if(readEfuseMac6(ll.runtime.myMac6)) {
+    ll.runtime.macReadOK = true;
+    last3FromMac6(ll.runtime.myLast3, ll.runtime.myMac6);
   }
   
-  ll.radio = &radio;
-  ll.toaUsMax17 = radio.getTimeOnAir(16);   // µs // 51ms for 16B @ SF7BW125CR45
+  ll.config.radio = &radio;
+  ll.runtime.toaUsMax17 = radio.getTimeOnAir(16);   // µs // 51ms for 16B @ SF7BW125CR45
   g_ll = &ll;
 
   return true;
@@ -255,7 +261,7 @@ inline void attachDio1(LLCC68& radio, Core& ll) {
 // Maximaler LBT-Backoff in Millisekunden basierend auf time-on-air für das längste Paket
 // (für 17-Byte-Paket ca. 51 ms bei SF7BW125CR45)
 inline uint16_t lbtBackoffMaxMs(const Core& ll) {
-  uint32_t ms = ll.toaUsMax17 / 1000U;   // floor(ToA/1000)
+  uint32_t ms = ll.runtime.toaUsMax17 / 1000U;   // floor(ToA/1000)
   return (ms < 5U) ? 5U : (uint16_t)ms;  // mind. 5 ms
 }
 
@@ -264,38 +270,38 @@ inline uint16_t randMs(Core& ll, uint16_t minMs, uint16_t maxMs) {
   if (maxMs <= minMs) return minMs;
   const int32_t lo = (int32_t)minMs;
   const int32_t hiExclusive = (int32_t)maxMs + 1;
-  int32_t r = ll.radio
-                ? ll.radio->random(lo, hiExclusive)      // PhysicalLayer::random
+  int32_t r = ll.config.radio
+                ? ll.config.radio->random(lo, hiExclusive)      // PhysicalLayer::random
                 : (int32_t)::random((long)lo, (long)hiExclusive);
   return (uint16_t)r;
 }
 
 // -------------------- RX/TX mode helpers --------------------
 inline void setDefaultIdle(Core& ll) {
-  ll.defaultRxKind = RxKind::None;
-  ll.defaultRxMs   = 0;
+  ll.config.defaultRxKind = RxKind::None;
+  ll.config.defaultRxMs   = 0;
 }
 inline void setDefaultRxContinuous(Core& ll) {
-  ll.defaultRxKind = RxKind::Continuous;
-  ll.defaultRxMs   = 0; // echt kontinuierlich
-  ll.reqRxKind = RxKind::Continuous; 
-  ll.reqRxMs = 0;
+  ll.config.defaultRxKind = RxKind::Continuous;
+  ll.config.defaultRxMs   = 0; // echt kontinuierlich
+  ll.runtime.reqRxKind = RxKind::Continuous; 
+  ll.runtime.reqRxMs = 0;
 }
 inline void requestRxTimed(Core& ll, uint16_t windowMs, int8_t rxNumWanted = -1) {
-  ll.reqRxKind = RxKind::Timed; 
-  ll.reqRxMs = windowMs;
-  ll.rxNumWanted = rxNumWanted;
-  ll.changeMode = true; // force window (re)open even if already in Timed RX
+  ll.runtime.reqRxKind = RxKind::Timed; 
+  ll.runtime.reqRxMs = windowMs;
+  ll.runtime.rxNumWanted = rxNumWanted;
+  ll.runtime.changeMode = true; // force window (re)open even if already in Timed RX
 }
 inline void requestRxContinuous(Core& ll) {
-  ll.reqRxKind = RxKind::Continuous; 
-  ll.reqRxMs = 0;
+  ll.runtime.reqRxKind = RxKind::Continuous; 
+  ll.runtime.reqRxMs = 0;
 }
 inline void cancelRxRequest(Core& ll) {
-  ll.changeMode = true;
-  ll.rfMode = Mode::Idle;
-  ll.reqRxKind = RxKind::None; 
-  ll.reqRxMs = 0;
+  ll.runtime.changeMode = true;
+  ll.runtime.rfMode = Mode::Idle;
+  ll.runtime.reqRxKind = RxKind::None; 
+  ll.runtime.reqRxMs = 0;
 }
 
 // One-slot TX scheduling (returns false if slot busy or oversize).
@@ -304,36 +310,36 @@ inline void cancelRxRequest(Core& ll) {
 // without LBT and jitterMaxMs=0 the TX is scheduled immediately
 inline bool scheduleSend(Core& ll, const uint8_t* buf, uint8_t len, uint16_t jitterMaxMs = 2500) {
 
-  if (ll.txPending || len == 0 || len > sizeof(ll.txBuf)) return false; // Check for pending TX or oversize
-  memcpy(ll.txBuf, buf, len);
-  ll.txLen = len;
-  ll.earliestTxAtMs = millis();
+  if (ll.runtime.txPending || len == 0 || len > sizeof(ll.runtime.txBuf)) return false; // Check for pending TX or oversize
+  memcpy(ll.runtime.txBuf, buf, len);
+  ll.runtime.txLen = len;
+  ll.runtime.earliestTxAtMs = millis();
   
   uint16_t jitterMinMs = 50; // default min jitter
 
-  if (ll.lbtEnable) {
+  if (ll.config.lbtEnable) {
     //jitterMaxMs = lbtBackoffMaxMs(ll);
     jitterMaxMs = 300; // fixed max backoff for LBT
     uint16_t randDelayMs = randMs(ll, jitterMinMs, jitterMaxMs);
-    //ll.debug = randDelayMs;
-    ll.earliestTxAtMs += randDelayMs;
-    ll.txArb = TxArbiter::CadNeeded;
+    //ll.runtime.debug = randDelayMs;
+    ll.runtime.earliestTxAtMs += randDelayMs;
+    ll.runtime.txArb = TxArbiter::CadNeeded;
   } 
   else {
     if (jitterMaxMs == 0) {
-      ll.earliestTxAtMs += 0; // no delay
+      ll.runtime.earliestTxAtMs += 0; // no delay
     }
     else if (jitterMaxMs > jitterMinMs) {
-      ll.earliestTxAtMs += randMs(ll, jitterMinMs, jitterMaxMs);
+      ll.runtime.earliestTxAtMs += randMs(ll, jitterMinMs, jitterMaxMs);
     }
     else {
-      ll.earliestTxAtMs += randMs(ll, jitterMinMs, 300); // at least some jitter
+      ll.runtime.earliestTxAtMs += randMs(ll, jitterMinMs, 300); // at least some jitter
     }
-    ll.txArb = TxArbiter::None;
+    ll.runtime.txArb = TxArbiter::None;
   }
 
-  ll.debug = 0;
-  ll.txPending = true; // mark TX as pending
+  ll.runtime.debug = 0;
+  ll.runtime.txPending = true; // mark TX as pending
   return true;
 }
 
@@ -365,91 +371,91 @@ inline void service(Core& ll, const Callbacks& cb) {
   const uint32_t now = millis();
 
   // (A) IRQ: TX-Done oder RX-Paket
-  if (ll.dio1Flag) {
-    ll.dio1Flag = false;
+  if (ll.runtime.dio1Flag) {
+    ll.runtime.dio1Flag = false;
 
-    if (ll.rfMode == Mode::Rx) {
-      size_t len = ll.radio->getPacketLength();
+    if (ll.runtime.rfMode == Mode::Rx) {
+      size_t len = ll.config.radio->getPacketLength();
       if (len >= sizeof(LoraProto::Header7)) {
         // TODO: ab hier nochmal checken! txBuf als maximale länge? -> besser hardcoden
         // können mehrere pakete im readData buffer enthalten sein?
 
-        if (len > sizeof(ll.txBuf)) len = sizeof(ll.txBuf);
+        if (len > sizeof(ll.runtime.txBuf)) len = sizeof(ll.runtime.txBuf);
         uint8_t pkt[64]; if (len > sizeof(pkt)) len = sizeof(pkt);
         
-        if (ll.radio->readData(pkt, len) == RADIOLIB_ERR_NONE) {
-          ++ll.rxCountTotal;
+        if (ll.config.radio->readData(pkt, len) == RADIOLIB_ERR_NONE) {
+          ++ll.telemetry.rxCountTotal;
 
           // Try filtering out unwanted packets early disabled for debugging
           LoraProto::Header7 h{};
           if (!LoraProto::parseHeader(pkt, (uint8_t)len, h)) return;
-          if (!receiverMatches(h.receiver, ll.myLast3)) return;  // broadcast ODER exakt meine 3B
+          if (!receiverMatches(h.receiver, ll.runtime.myLast3)) return;  // broadcast ODER exakt meine 3B
           //if (LoraProto::type_dir(h.type) != LoraProto::DIR_M2N) return; // muss je nach rolle im hauptcode geprüft werden
 
-          ll.lastRssi = (int16_t)ll.radio->getRSSI(true);
-          ll.lastSnr  = (int8_t) ll.radio->getSNR();
+          ll.telemetry.lastRssi = (int16_t)ll.config.radio->getRSSI(true);
+          ll.telemetry.lastSnr  = (int8_t) ll.config.radio->getSNR();
 
-          if(ll.rxNumWanted > 0) --ll.rxNumWanted; // nur wenn begrenzte Anzahl erwartet
+          if(ll.runtime.rxNumWanted > 0) --ll.runtime.rxNumWanted; // nur wenn begrenzte Anzahl erwartet
          
-          ++ll.rxCountFiltered;
-          ll.lastRxAtMs = now;
-          if (cb.onRxPacket) cb.onRxPacket(pkt, (uint8_t)len, ll.lastRssi, ll.lastSnr, cb.ctx);
+          ++ll.telemetry.rxCountFiltered;
+          ll.telemetry.lastRxAtMs = now;
+          if (cb.onRxPacket) cb.onRxPacket(pkt, (uint8_t)len, ll.telemetry.lastRssi, ll.telemetry.lastSnr, cb.ctx);
         }
       }
       // Rx fortsetzen nicht nötig (nutze immer continuous RX)
-      /* if (!ll.txPending && ll.rxKind != RxKind::None) {
-        ll.radio->startReceive(); // nicht nötig, startReceive löst continuous RX aus
+      /* if (!ll.runtime.txPending && ll.runtime.rxKind != RxKind::None) {
+        ll.config.radio->startReceive(); // nicht nötig, startReceive löst continuous RX aus
       } */
     }
   }
   // (B) Wenn im Idle, dann gewünschten Modus prüfen und wechseln
-  if(ll.rfMode == Mode::Idle) {
+  if(ll.runtime.rfMode == Mode::Idle) {
     // Idle → gewünschten Modus prüfen
 
-    if (ll.txPending) {
+    if (ll.runtime.txPending) {
       // TX steht an
-      ll.rfMode = Mode::Tx;
-      ll.changeMode = true;
-      //ll.reqRxKind = RxKind::None;
-      //ll.reqRxMs = 0;
+      ll.runtime.rfMode = Mode::Tx;
+      ll.runtime.changeMode = true;
+      //ll.runtime.reqRxKind = RxKind::None;
+      //ll.runtime.reqRxMs = 0;
       return;
     }
-    else if (ll.reqRxKind == RxKind::None && 
-      (ll.reqRxKind != ll.rxKind || ll.changeMode)) {
+    else if (ll.runtime.reqRxKind == RxKind::None && 
+      (ll.runtime.reqRxKind != ll.runtime.rxKind || ll.runtime.changeMode)) {
 
       // kein RX gewünscht, Idle festigen
-      ll.radio->standby();
-      ll.rxKind = RxKind::None;
-      ll.changeMode = false;
-      //ll.reqRxMs = 0; //unnötig
+      ll.config.radio->standby();
+      ll.runtime.rxKind = RxKind::None;
+      ll.runtime.changeMode = false;
+      //ll.runtime.reqRxMs = 0; //unnötig
       if (cb.onIdle) cb.onIdle(cb.ctx);
       return; // fertig
     }
-    else if (ll.reqRxKind != RxKind::None) {
+    else if (ll.runtime.reqRxKind != RxKind::None) {
 
       // RX gewünscht
-      ll.rfMode = Mode::Rx;
-      ll.changeMode = true;
+      ll.runtime.rfMode = Mode::Rx;
+      ll.runtime.changeMode = true;
       return; // fertig
     }
   }
 
   // (B) TX pending starten, wenn sendezeit erreicht, aber kein timed RX läuft
-  //if (ll.txPending && ll.rxKind != RxKind::Timed && (int32_t)(now - ll.earliestTxAtMs) >= 0) {
-  if (ll.rfMode == Mode::Tx) {
+  //if (ll.runtime.txPending && ll.runtime.rxKind != RxKind::Timed && (int32_t)(now - ll.runtime.earliestTxAtMs) >= 0) {
+  if (ll.runtime.rfMode == Mode::Tx) {
     
-    if (ll.changeMode) {
-      ll.radio->standby(); // sicherstellen, dass nichts mehr empfangen wird bis earliestTxAtMs
-      ll.changeMode = false; // TX jetzt durchziehen
+    if (ll.runtime.changeMode) {
+      ll.config.radio->standby(); // sicherstellen, dass nichts mehr empfangen wird bis earliestTxAtMs
+      ll.runtime.changeMode = false; // TX jetzt durchziehen
       if (cb.onTxStart) cb.onTxStart(cb.ctx);
     }
 
-    if((int32_t)(now - ll.earliestTxAtMs) < 0) {
+    if((int32_t)(now - ll.runtime.earliestTxAtMs) < 0) {
       return; // noch nicht Zeit zum Senden
     }
 
     // LBT / CAD wenn nötig
-    if (ll.txArb == TxArbiter::CadNeeded) {
+    if (ll.runtime.txArb == TxArbiter::CadNeeded) {
       // zum senden in scheduleSend nur txArb auf CadNeeded und txPending auf true setzen
       ChannelScanConfig_t cfg = {
         .cad = {
@@ -463,89 +469,89 @@ inline void service(Core& ll, const Callbacks& cb) {
         },
       };
 
-      //int16_t state = ll.radio->startChannelScan(cfg);
-      int16_t state = ll.radio->scanChannel(cfg);
+      //int16_t state = ll.config.radio->startChannelScan(cfg);
+      int16_t state = ll.config.radio->scanChannel(cfg);
       
       if (state != RADIOLIB_CHANNEL_FREE) {
         // busy → kurzen Backoff und erneut CAD wenn Zeit erreicht
-        ll.earliestTxAtMs = now + randMs(ll, 100, 200); // fixed backoff for LBT
-        ll.txArb = TxArbiter::CadNeeded;
-        ll.debug += 1; // debug counter für busy CAD
-        //if(ll.debug <= 2) ll.debug = 2;
+        ll.runtime.earliestTxAtMs = now + randMs(ll, 100, 200); // fixed backoff for LBT
+        ll.runtime.txArb = TxArbiter::CadNeeded;
+        ll.runtime.debug += 1; // debug counter für busy CAD
+        //if(ll.runtime.debug <= 2) ll.runtime.debug = 2;
         return; // kein weiterer Service jetzt
       }
       else {
-        ll.txArb = TxArbiter::None;
+        ll.runtime.txArb = TxArbiter::None;
         // weiter zum senden
       }
     }
-    if(ll.txArb == TxArbiter::None) {
+    if(ll.runtime.txArb == TxArbiter::None) {
       //if (cb.onTxStart) cb.onTxStart(cb.ctx); // schon bei CAD aufrufen?
-      if (ll.radio->transmit(ll.txBuf, ll.txLen) == RADIOLIB_ERR_NONE) {
-        ll.txPending = false;
-        //ll.reqRxKind = ll.defaultRxKind; // nach TX wieder in default RX modus wechseln
-        //ll.reqRxMs   = ll.defaultRxMs;
+      if (ll.config.radio->transmit(ll.runtime.txBuf, ll.runtime.txLen) == RADIOLIB_ERR_NONE) {
+        ll.runtime.txPending = false;
+        //ll.runtime.reqRxKind = ll.config.defaultRxKind; // nach TX wieder in default RX modus wechseln
+        //ll.runtime.reqRxMs   = ll.config.defaultRxMs;
         
-        ++ll.txCount;
-        ll.lastTxAtMs = now;
+        ++ll.telemetry.txCount;
+        ll.telemetry.lastTxAtMs = now;
         
-        //ll.debug = 100;
+        //ll.runtime.debug = 100;
         if (cb.onTxDone) cb.onTxDone(cb.ctx);        
         
-        ll.rfMode = Mode::Idle;
-        ll.changeMode = true;
+        ll.runtime.rfMode = Mode::Idle;
+        ll.runtime.changeMode = true;
 
         return; // gesendet, nun platz machen für restlichen code
       }
       else {
-        ll.txArb = TxArbiter::CadNeeded;
+        ll.runtime.txArb = TxArbiter::CadNeeded;
         return;
       }
     }
   }
   // (D) RX-Requests bedienen
-  if (ll.rfMode == Mode::Rx) {
+  if (ll.runtime.rfMode == Mode::Rx) {
     
     // check TX pending (especially for continuous RX)
-    if (ll.txPending) {
-      if (ll.rxKind == RxKind::Timed) {
-        const uint16_t delta = ll.rxCountFiltered - ll.rxCountWinStart;
+    if (ll.runtime.txPending) {
+      if (ll.runtime.rxKind == RxKind::Timed) {
+        const uint16_t delta = ll.telemetry.rxCountFiltered - ll.runtime.rxCountWinStart;
         if (cb.onRxWindowClosed) cb.onRxWindowClosed(delta, cb.ctx);
       }
-      ll.rxKind = RxKind::None;
-      ll.rxWindowEndMs = 0;
-      ll.rxNumWanted = -1;
-      ll.rfMode = Mode::Idle; // Wechsel zu Tx ermöglichen
-      ll.radio->standby(); // Empfang sofort beenden, nicht erst wenn earliestTxAtMs erreicht ist
-      ll.changeMode = true;
+      ll.runtime.rxKind = RxKind::None;
+      ll.runtime.rxWindowEndMs = 0;
+      ll.runtime.rxNumWanted = -1;
+      ll.runtime.rfMode = Mode::Idle; // Wechsel zu Tx ermöglichen
+      ll.config.radio->standby(); // Empfang sofort beenden, nicht erst wenn earliestTxAtMs erreicht ist
+      ll.runtime.changeMode = true;
       return;
     }
 
     // RX-Window Timeout prüfen und ggf. beenden
-    if (ll.rxKind == RxKind::Timed && ll.rxWindowEndMs > 0) {
+    if (ll.runtime.rxKind == RxKind::Timed && ll.runtime.rxWindowEndMs > 0) {
       // RX-Timed: laufendes Fenster -> Fensterende prüfen
       
-      if ((int32_t)(now - ll.rxWindowEndMs) >= 0 || ll.rxNumWanted == 0) {
+      if ((int32_t)(now - ll.runtime.rxWindowEndMs) >= 0 || ll.runtime.rxNumWanted == 0) {
         // Fensterende erreicht oder alle Antworten empfangen
 
-        if(ll.lbtRxRelax && ll.rxNumWanted != 0) {
+        if(ll.config.lbtRxRelax && ll.runtime.rxNumWanted != 0) {
           // LBT Rx-Relax: RX fortsetzen bis seit dem letzten Paket länger als rxLbtTimeout ms vergangen sind
           // Ausnahme: wenn rxNumWanted==0 (alle Antworten empfangen)
-          const uint32_t deltaSinceLastRx = now - ll.lastRxAtMs;
-          if (deltaSinceLastRx < ll.rxLbtTimeout) {
+          const uint32_t deltaSinceLastRx = now - ll.telemetry.lastRxAtMs;
+          if (deltaSinceLastRx < ll.config.rxLbtTimeout) {
             // noch nicht timeout
             return; // nichts tun, RX läuft weiter
           }
         }
 
-        ll.rfMode = Mode::Idle;
-        ll.reqRxKind = ll.defaultRxKind; // nach RX wieder in default modus wechseln
-        ll.reqRxMs   = ll.defaultRxMs;
-        ll.changeMode = true;
-        ll.rxWindowEndMs = 0;
-        ll.rxNumWanted = -1;
+        ll.runtime.rfMode = Mode::Idle;
+        ll.runtime.reqRxKind = ll.config.defaultRxKind; // nach RX wieder in default modus wechseln
+        ll.runtime.reqRxMs   = ll.config.defaultRxMs;
+        ll.runtime.changeMode = true;
+        ll.runtime.rxWindowEndMs = 0;
+        ll.runtime.rxNumWanted = -1;
         
-        const uint16_t delta = ll.rxCountFiltered - ll.rxCountWinStart;
+        const uint16_t delta = ll.telemetry.rxCountFiltered - ll.runtime.rxCountWinStart;
         if (cb.onRxWindowClosed) cb.onRxWindowClosed(delta, cb.ctx);
 
         return; // fertig
@@ -554,31 +560,31 @@ inline void service(Core& ll, const Callbacks& cb) {
       return; // laufendes Fenster noch nicht beendet
     }
 
-    if (ll.changeMode) {
+    if (ll.runtime.changeMode) {
       // komme von Idle: Continous RX starten
-      if(ll.radio->startReceive() != RADIOLIB_ERR_NONE) {
+      if(ll.config.radio->startReceive() != RADIOLIB_ERR_NONE) {
         // RX nicht gestartet
         return; // fehler, wird im nächsten durchgang erneut versucht
       }
     }
 
-    if (ll.changeMode || ll.rxKind != ll.reqRxKind) {
+    if (ll.runtime.changeMode || ll.runtime.rxKind != ll.runtime.reqRxKind) {
       // von einem rx modus in einen anderen wechseln
 
-      if(ll.reqRxKind==RxKind::Timed) {
+      if(ll.runtime.reqRxKind==RxKind::Timed) {
         // setze rxWindowEndMs reqRxMs
         // bei LBT automatisch kürzeres rxWindow? -> bei scheduleSend entsprechend anpassen
-        ll.rxCountWinStart = ll.rxCountFiltered;
-        const uint16_t w = (ll.reqRxMs ? ll.reqRxMs : ll.defaultRxMs);
-        ll.rxWindowEndMs = now + w;
+        ll.runtime.rxCountWinStart = ll.telemetry.rxCountFiltered;
+        const uint16_t w = (ll.runtime.reqRxMs ? ll.runtime.reqRxMs : ll.config.defaultRxMs);
+        ll.runtime.rxWindowEndMs = now + w;
         if (cb.onRxWindowOpen) cb.onRxWindowOpen(w, cb.ctx);
       }
-      else if(ll.reqRxKind==RxKind::Continuous) {
-        ll.rxWindowEndMs = 0;
+      else if(ll.runtime.reqRxKind==RxKind::Continuous) {
+        ll.runtime.rxWindowEndMs = 0;
         if (cb.onRxWindowOpen) cb.onRxWindowOpen(0, cb.ctx);
       }
-      ll.rxKind = ll.reqRxKind; // nach übernahme des neuen modus setzen
-      ll.changeMode = false; // mode change done
+      ll.runtime.rxKind = ll.runtime.reqRxKind; // nach übernahme des neuen modus setzen
+      ll.runtime.changeMode = false; // mode change done
     }
   }
 }
