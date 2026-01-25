@@ -285,6 +285,7 @@ inline void requestRxTimed(Core& ll, uint16_t windowMs, int8_t rxNumWanted = -1)
   ll.reqRxKind = RxKind::Timed; 
   ll.reqRxMs = windowMs;
   ll.rxNumWanted = rxNumWanted;
+  ll.changeMode = true; // force window (re)open even if already in Timed RX
 }
 inline void requestRxContinuous(Core& ll) {
   ll.reqRxKind = RxKind::Continuous; 
@@ -507,6 +508,13 @@ inline void service(Core& ll, const Callbacks& cb) {
     
     // check TX pending (especially for continuous RX)
     if (ll.txPending) {
+      if (ll.rxKind == RxKind::Timed) {
+        const uint16_t delta = ll.rxCountFiltered - ll.rxCountWinStart;
+        if (cb.onRxWindowClosed) cb.onRxWindowClosed(delta, cb.ctx);
+      }
+      ll.rxKind = RxKind::None;
+      ll.rxWindowEndMs = 0;
+      ll.rxNumWanted = -1;
       ll.rfMode = Mode::Idle; // Wechsel zu Tx ermöglichen
       ll.radio->standby(); // Empfang sofort beenden, nicht erst wenn earliestTxAtMs erreicht ist
       ll.changeMode = true;
@@ -534,7 +542,9 @@ inline void service(Core& ll, const Callbacks& cb) {
         ll.reqRxKind = ll.defaultRxKind; // nach RX wieder in default modus wechseln
         ll.reqRxMs   = ll.defaultRxMs;
         ll.changeMode = true;
-
+        ll.rxWindowEndMs = 0;
+        ll.rxNumWanted = -1;
+        
         const uint16_t delta = ll.rxCountFiltered - ll.rxCountWinStart;
         if (cb.onRxWindowClosed) cb.onRxWindowClosed(delta, cb.ctx);
 
