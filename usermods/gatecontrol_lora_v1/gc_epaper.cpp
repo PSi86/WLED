@@ -1,0 +1,473 @@
+#include "gc_epaper.h"
+#include <SPI.h>
+
+// base class GxEPD2_GFX can be used to pass references or pointers to the display instance as parameter, uses ~1.2k more code
+#define ENABLE_GxEPD2_GFX 0
+#include <GxEPD2_BW.h>
+
+// Fonts (Adafruit GFX fonts)
+#include <Fonts/FreeSansBold24pt7b.h>
+#include <Fonts/FreeSansBold18pt7b.h>
+#include <Fonts/FreeSansBold12pt7b.h>
+#include <Fonts/FreeMonoBold9pt7b.h>
+
+// -----------------------------
+// Pin defaults (override via PlatformIO build_flags: -D ...)
+// -----------------------------
+#ifndef GC_EPAPER_CS
+  #define GC_EPAPER_CS   10
+#endif
+#ifndef GC_EPAPER_BUSY
+  #define GC_EPAPER_BUSY 3
+#endif
+#ifndef GC_EPAPER_RST
+  #define GC_EPAPER_RST  46
+#endif
+#ifndef GC_EPAPER_DC
+  #define GC_EPAPER_DC   9
+#endif
+
+// Configurable SPI pins (MISO is typically not used by ePaper modules)
+#ifndef GC_EPAPER_MOSI
+  #define GC_EPAPER_MOSI 11
+#endif
+#ifndef GC_EPAPER_SCK
+  #define GC_EPAPER_SCK  12
+#endif
+#ifndef GC_EPAPER_MISO
+  #define GC_EPAPER_MISO -1
+#endif
+
+#ifndef WLED_RELEASE_NAME
+  #define WLED_RELEASE_NAME "WLED"
+#endif
+
+// -----------------------------
+// Deferred refresh behavior
+// -----------------------------
+// Full refresh will be triggered in service_epaper() after no update was
+// received for GC_EPAPER_REFRESH_DELAY_MS.
+#ifndef GC_EPAPER_REFRESH_DELAY_MS
+  #define GC_EPAPER_REFRESH_DELAY_MS 1500
+#endif
+
+// If updates keep coming, still perform a refresh after this max deferral.
+#ifndef GC_EPAPER_MAX_DEFER_MS
+  #define GC_EPAPER_MAX_DEFER_MS 4000
+#endif
+
+// Safety: don't full-refresh too frequently.
+#ifndef GC_EPAPER_MIN_REFRESH_INTERVAL_MS
+  #define GC_EPAPER_MIN_REFRESH_INTERVAL_MS 10000
+#endif
+
+// Optional periodic maintenance refresh (disabled by default).
+// Set to e.g. 600000 (10min) if you notice ghosting over long runtimes.
+#ifndef GC_EPAPER_MAINTENANCE_REFRESH_MS
+  #define GC_EPAPER_MAINTENANCE_REFRESH_MS 0
+#endif
+
+// Hibernate between refreshes (saves power). If you run into wake issues,
+// set to 0.
+#ifndef GC_EPAPER_USE_HIBERNATE
+  #define GC_EPAPER_USE_HIBERNATE 1
+#endif
+
+// 2.9\" EPD Module (B/W)
+static GxEPD2_BW<GxEPD2_290_BS, GxEPD2_290_BS::HEIGHT> display(
+  GxEPD2_290_BS(/*CS=*/ GC_EPAPER_CS, /*DC=*/ GC_EPAPER_DC, /*RES=*/ GC_EPAPER_RST, /*BUSY=*/ GC_EPAPER_BUSY)
+);
+
+// -----------------------------
+// State
+// -----------------------------
+static uint8_t g_numPilots = 1;
+
+static char g_nick[4][21];   // max 20 chars + NUL
+static char g_label[4][3];   // max 2 chars + NUL
+
+static bool g_initialized = false;
+static bool g_hibernated = false;
+static bool g_hasPilotData = false;
+
+static bool g_refreshPending = false;
+static uint32_t g_lastUpdateMs = 0;  // last received update command
+static uint32_t g_firstUpdateMs = 0; // first update command since pending started
+static uint32_t g_lastRefreshMs = 0; // last full refresh
+
+// -----------------------------
+// Helpers
+// -----------------------------
+static void toUpperAscii(const char* in, char* out, size_t outSize)
+{
+  if (!out || outSize == 0) return;
+  size_t i = 0;
+  for (; in && in[i] && (i + 1) < outSize; i++)
+  {
+    char c = in[i];
+    if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
+    out[i] = c;
+  }
+  out[i] = '\0';
+}
+
+static void safeCopyTrunc(const char* in, char* out, size_t outSize)
+{
+  if (!out || outSize == 0) return;
+  if (!in) { out[0] = '\0'; return; }
+  size_t i = 0;
+  for (; in[i] && (i + 1) < outSize; i++) out[i] = in[i];
+  out[i] = '\0';
+}
+
+static const GFXfont* pickFontFit(const char* txt, uint16_t maxWidth, uint16_t maxHeight)
+{
+  const GFXfont* fonts[] = {
+    &FreeSansBold24pt7b,
+    &FreeSansBold18pt7b,
+    &FreeSansBold12pt7b,
+    &FreeMonoBold9pt7b,
+  };
+
+  int16_t tbx, tby;
+  uint16_t tbw, tbh;
+
+  for (auto f : fonts)
+  {
+    display.setFont(f);
+    display.getTextBounds(txt, 0, 0, &tbx, &tby, &tbw, &tbh);
+    if (tbw <= maxWidth && tbh <= maxHeight) return f;
+  }
+  return &FreeMonoBold9pt7b;
+}
+
+static const GFXfont* pickLabelFont(uint16_t rowHeight)
+{
+  const GFXfont* fonts[] = {
+    &FreeSansBold24pt7b,
+    &FreeSansBold18pt7b,
+    &FreeSansBold12pt7b,
+    &FreeMonoBold9pt7b,
+  };
+
+  const char* sample = "WW";
+  int16_t tbx, tby;
+  uint16_t tbw, tbh;
+
+  for (auto f : fonts)
+  {
+    display.setFont(f);
+    display.getTextBounds(sample, 0, 0, &tbx, &tby, &tbw, &tbh);
+    if (tbh + 6 <= rowHeight) return f;
+  }
+  return &FreeMonoBold9pt7b;
+}
+
+static uint16_t computeBarWidth(const GFXfont* labelFont, uint16_t displayW)
+{
+  display.setFont(labelFont);
+  int16_t tbx, tby;
+  uint16_t tbw, tbh;
+  display.getTextBounds("WW", 0, 0, &tbx, &tby, &tbw, &tbh);
+
+  const uint16_t padX = 12;
+  uint16_t barW = tbw + 2 * padX;
+
+  if (barW < 56) barW = 56;
+  if (barW > (displayW * 3) / 5) barW = (displayW * 3) / 5;
+  return barW;
+}
+
+static void drawCenteredText(const char* txt, const GFXfont* font, int16_t areaX, int16_t areaY, uint16_t areaW, uint16_t areaH, uint16_t color)
+{
+  display.setFont(font);
+  display.setTextColor(color);
+
+  int16_t tbx, tby;
+  uint16_t tbw, tbh;
+  display.getTextBounds(txt, 0, 0, &tbx, &tby, &tbw, &tbh);
+
+  int16_t x = areaX + int16_t((areaW - tbw) / 2) - tbx;
+  int16_t y = areaY + int16_t(areaH / 2) - int16_t(tbh / 2) - tby;
+
+  display.setCursor(x, y);
+  display.print(txt);
+}
+
+// -----------------------------
+// Rendering
+// -----------------------------
+static void renderStartScreen()
+{
+  display.setRotation(1); // landscape
+  const uint16_t W = display.width();
+  const uint16_t H = display.height();
+
+  display.setFullWindow();
+  display.firstPage();
+  do
+  {
+    display.fillScreen(GxEPD_WHITE);
+
+    drawCenteredText("GateControl Startblock", pickFontFit("GateControl Startblock", W - 16, (H / 2) - 4),
+                     0, 0, W, H / 2, GxEPD_BLACK);
+
+    drawCenteredText(WLED_RELEASE_NAME, pickFontFit(WLED_RELEASE_NAME, W - 16, (H / 2) - 4),
+                     0, H / 2, W, H / 2, GxEPD_BLACK);
+  }
+  while (display.nextPage());
+}
+
+static void renderLayout1()
+{
+  display.setRotation(1);
+  const uint16_t W = display.width();
+  const uint16_t H = display.height();
+
+  const GFXfont* labelFont = &FreeSansBold24pt7b;
+  {
+    int16_t tbx, tby; uint16_t tbw, tbh;
+    display.setFont(labelFont);
+    display.getTextBounds("WW", 0, 0, &tbx, &tby, &tbw, &tbh);
+    if (tbh + 10 > H) labelFont = &FreeSansBold18pt7b;
+  }
+
+  const uint16_t barW = computeBarWidth(labelFont, W);
+  const uint16_t barX = W - barW;
+  const uint16_t leftW = W - barW;
+
+  const uint16_t leftPadX = 10;
+  const uint16_t nickMaxW = (leftW > (2 * leftPadX)) ? (leftW - 2 * leftPadX) : leftW;
+  const uint16_t nickMaxH = H - 8;
+
+  const char* nickUpper = g_nick[0];
+  const GFXfont* nickFont = pickFontFit(nickUpper, nickMaxW, nickMaxH);
+
+  display.setFullWindow();
+  display.firstPage();
+  do
+  {
+    display.fillScreen(GxEPD_WHITE);
+    display.fillRect(barX, 0, barW, H, GxEPD_BLACK);
+
+    // nickname
+    display.setFont(nickFont);
+    display.setTextColor(GxEPD_BLACK);
+
+    int16_t tbx, tby; uint16_t tbw, tbh;
+    display.getTextBounds(nickUpper, 0, 0, &tbx, &tby, &tbw, &tbh);
+
+    int16_t nickX = int16_t(leftPadX) - tbx;
+    int16_t nickY = int16_t(H / 2) - int16_t(tbh / 2) - tby;
+
+    display.setCursor(nickX, nickY);
+    display.print(nickUpper);
+
+    // label
+    display.setFont(labelFont);
+    display.setTextColor(GxEPD_WHITE);
+
+    display.getTextBounds(g_label[0], 0, 0, &tbx, &tby, &tbw, &tbh);
+    int16_t rX = int16_t(barX) + int16_t((barW - tbw) / 2) - tbx;
+    int16_t rY = int16_t(H / 2) - int16_t(tbh / 2) - tby;
+
+    display.setCursor(rX, rY);
+    display.print(g_label[0]);
+  }
+  while (display.nextPage());
+}
+
+static void renderLayoutMulti()
+{
+  display.setRotation(1);
+  const uint16_t W = display.width();
+  const uint16_t H = display.height();
+
+  const uint8_t n = g_numPilots;
+  const uint16_t rowH = H / n;
+
+  const GFXfont* labelFont = pickLabelFont(rowH);
+  const uint16_t barW = computeBarWidth(labelFont, W);
+  const uint16_t barX = W - barW;
+  const uint16_t leftW = W - barW;
+
+  const uint16_t leftPadX = 10;
+  const uint16_t nickMaxW = (leftW > (2 * leftPadX)) ? (leftW - 2 * leftPadX) : leftW;
+  const uint16_t nickMaxH = rowH - 6;
+
+  display.setFullWindow();
+  display.firstPage();
+  do
+  {
+    display.fillScreen(GxEPD_WHITE);
+
+    for (uint8_t i = 0; i < n; i++)
+    {
+      const uint16_t y0 = uint16_t(i) * rowH;
+      if (i > 0) display.drawLine(0, y0, W - 1, y0, GxEPD_BLACK);
+
+      display.fillRect(barX, y0, barW, rowH, GxEPD_BLACK);
+
+      // nickname
+      const char* nickUpper = g_nick[i];
+      const GFXfont* nickFont = pickFontFit(nickUpper, nickMaxW, nickMaxH);
+
+      display.setFont(nickFont);
+      display.setTextColor(GxEPD_BLACK);
+
+      int16_t tbx, tby; uint16_t tbw, tbh;
+      display.getTextBounds(nickUpper, 0, 0, &tbx, &tby, &tbw, &tbh);
+
+      int16_t nickX = int16_t(leftPadX) - tbx;
+      int16_t nickY = int16_t(y0 + rowH / 2) - int16_t(tbh / 2) - tby;
+
+      display.setCursor(nickX, nickY);
+      display.print(nickUpper);
+
+      // label
+      display.setFont(labelFont);
+      display.setTextColor(GxEPD_WHITE);
+
+      display.getTextBounds(g_label[i], 0, 0, &tbx, &tby, &tbw, &tbh);
+      int16_t rX = int16_t(barX) + int16_t((barW - tbw) / 2) - tbx;
+      int16_t rY = int16_t(y0 + rowH / 2) - int16_t(tbh / 2) - tby;
+
+      display.setCursor(rX, rY);
+      display.print(g_label[i]);
+    }
+  }
+  while (display.nextPage());
+}
+
+static void renderAll()
+{
+  if (g_numPilots <= 1) renderLayout1();
+  else renderLayoutMulti();
+}
+
+static void wakeIfNeeded()
+{
+  if (!g_initialized) return;
+  if (!g_hibernated) return;
+
+  // Wake the panel without a full reset sequence
+  display.init(115200, false, 20, false);
+  g_hibernated = false;
+}
+
+static void maybeHibernate()
+{
+#if GC_EPAPER_USE_HIBERNATE
+  display.hibernate();
+  g_hibernated = true;
+#else
+  g_hibernated = false;
+#endif
+}
+
+static void scheduleDeferredRefresh()
+{
+  const uint32_t now = millis();
+  if (!g_refreshPending) g_firstUpdateMs = now;
+  g_refreshPending = true;
+  g_lastUpdateMs = now;
+}
+
+// -----------------------------
+// Public API
+// -----------------------------
+void epaperInit()
+{
+  SPI.begin(GC_EPAPER_SCK, GC_EPAPER_MISO, GC_EPAPER_MOSI, GC_EPAPER_CS);
+  display.init(115200, true, 50, false);
+  g_initialized = true;
+  g_hibernated = false;
+
+  for (uint8_t i = 0; i < 4; i++)
+  {
+    g_nick[i][0]  = '\0';
+    g_label[i][0] = '\0';
+  }
+  g_numPilots = 1;
+
+  renderStartScreen();
+  g_lastRefreshMs = millis();
+  maybeHibernate();
+}
+
+void setDisplayLayout(uint8_t numPilots)
+{
+  if (numPilots < 1) numPilots = 1;
+  if (numPilots > 4) numPilots = 4;
+
+  g_numPilots = numPilots;
+
+  for (uint8_t i = numPilots; i < 4; i++)
+  {
+    g_nick[i][0]  = '\0';
+    g_label[i][0] = '\0';
+  }
+
+  // If we already have pilot data, schedule a refresh so the new layout becomes visible
+  if (g_hasPilotData) scheduleDeferredRefresh();
+}
+
+bool setPilotSlotData(const char* nickname, const char* raceLabel, uint8_t slot)
+{
+  if (slot < 1 || slot > 4) return false;
+  if (slot > g_numPilots) return false;
+
+  const uint8_t idx = slot - 1;
+
+  // nickname: max 20 chars, stored uppercase
+  char tmpNick[21];
+  safeCopyTrunc(nickname, tmpNick, sizeof(tmpNick));
+  toUpperAscii(tmpNick, g_nick[idx], sizeof(g_nick[idx]));
+
+  // label: max 2 chars, stored uppercase
+  char tmpLbl[3];
+  safeCopyTrunc(raceLabel, tmpLbl, sizeof(tmpLbl));
+  toUpperAscii(tmpLbl, g_label[idx], sizeof(g_label[idx]));
+
+  g_hasPilotData = true;
+  scheduleDeferredRefresh();
+  return true;
+}
+
+void service_epaper()
+{
+  if (!g_initialized) return;
+
+  const uint32_t now = millis();
+
+  // Deferred refresh after updates
+  if (g_refreshPending)
+  {
+    const bool dueByDelay = (uint32_t)(now - g_lastUpdateMs) >= (uint32_t)GC_EPAPER_REFRESH_DELAY_MS;
+    const bool dueByMax   = (uint32_t)(now - g_firstUpdateMs) >= (uint32_t)GC_EPAPER_MAX_DEFER_MS;
+    const bool minOk      = (uint32_t)(now - g_lastRefreshMs) >= (uint32_t)GC_EPAPER_MIN_REFRESH_INTERVAL_MS;
+
+    if ((dueByDelay || dueByMax) && minOk)
+    {
+      wakeIfNeeded();
+      renderAll();
+      g_lastRefreshMs = now;
+      g_refreshPending = false;
+      maybeHibernate();
+    }
+  }
+  else
+  {
+    // Optional periodic maintenance refresh to reduce ghosting over very long runtimes
+    if (GC_EPAPER_MAINTENANCE_REFRESH_MS > 0 && g_hasPilotData)
+    {
+      if ((uint32_t)(now - g_lastRefreshMs) >= (uint32_t)GC_EPAPER_MAINTENANCE_REFRESH_MS)
+      {
+        wakeIfNeeded();
+        renderAll();
+        g_lastRefreshMs = now;
+        maybeHibernate();
+      }
+    }
+  }
+}

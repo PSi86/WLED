@@ -1,6 +1,6 @@
 #pragma once
-#include "wled.h"
 
+#include "wled.h"
 #include "lora_link_core.h"
 //#include "lora_proto.h"
 
@@ -13,6 +13,11 @@ extern "C" {
 }
 
 #define FW_VERSION 2 // Version of the GateControlLoRa firmware
+
+#ifndef DEV_TYPE
+  #define DEV_TYPE 10 // WLED Device type for GateControlLoRa
+#endif
+
 using GateCore = LoraProto::P_Control;  // 4B: groupId, flags, presetId, brightness
 
 // ===================== WLED Sync over LoRa =====================

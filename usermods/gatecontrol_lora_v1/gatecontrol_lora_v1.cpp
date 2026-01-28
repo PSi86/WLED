@@ -1,6 +1,10 @@
 #include "gatecontrol_lora_v1.h"
 //#include <WiFi.h>  // fallback for WiFi.macAddress()
 
+#ifdef GC_EPAPER
+#include "gc_epaper.h"
+#endif
+
 static LoraLink::Core ll{};
 static LoraLink::Callbacks cb{};
 
@@ -76,6 +80,10 @@ void UsermodGateControlLoRa::setup() {
   cb.ctx        = this; // sehr wichtig: für handlePacket
 
   DEBUG_PRINTLN(F("[GateLoRa] Radio init OK"));
+  
+  #ifdef GC_EPAPER
+    epaperInit();
+  #endif
 }
 
 // ========= Loop =========
@@ -91,6 +99,9 @@ void UsermodGateControlLoRa::loop() {
       DEBUG_PRINTLN(F("[GateLoRa] Battery UM data acquired"));
     }
   }
+  #ifdef GC_EPAPER
+  service_epaper(); // e-paper display service
+  #endif
 }
 
 // ========= Info (UI) =========
@@ -581,8 +592,8 @@ void UsermodGateControlLoRa::sendIdentifyReplyTo(const uint8_t destLast3[3], boo
   uint8_t out[32];
 
   P_IdentifyReply p{};
-  p.fw = FW_VERSION;
-  p.caps            = 0x01; // Bit0 = WLED vorhanden
+  p.fw = PROTO_VER_MAJOR; // fw = protocol version
+  p.caps            = DEV_TYPE; // caps in dev_type umbenennen
   p.groupId         = current.groupId;
 
   if (includeFullMac && ll.macReadOK) {

@@ -2,7 +2,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-// LoRaProto v1.1 -- shared, header-only protocol for ESP32 + SX1262
+// LoRaProto v2.0 -- shared, header-only protocol for ESP32 + SX1262
 // Packet = Header7 (3B sender + 3B receiver + 1B type) + Body (0..20B)
 // Direction bit (0x80): 0 = Master->Node, 1 = Node->Master
 // Broadcast: receiver3 == FF:FF:FF
@@ -11,8 +11,8 @@
 namespace LoraProto {
 
 // -------------------- Versioning --------------------
-static const uint8_t PROTO_VER_MAJOR = 1;
-static const uint8_t PROTO_VER_MINOR = 4;
+static const uint8_t PROTO_VER_MAJOR = 2;
+static const uint8_t PROTO_VER_MINOR = 0;
 
 // -------------------- Direction/Type helpers --------------------
 static const uint8_t DIR_M2N = 0x00;  // Master -> Node
