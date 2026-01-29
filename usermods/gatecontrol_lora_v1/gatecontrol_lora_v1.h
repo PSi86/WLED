@@ -192,6 +192,11 @@ private:
   // Discovery reply target
   uint8_t targetForReplyLast3[3] = {0};
 
+  #if DEV_TYPE == 50
+    uint8_t numberOfSlots = 1;
+    uint8_t firstSlot = 1;
+  #endif
+
   // ===== Debug/Diag =====
   bool    radioReady = false;
   int16_t radioInitCode = 0;

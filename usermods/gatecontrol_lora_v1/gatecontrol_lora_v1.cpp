@@ -277,6 +277,11 @@ void UsermodGateControlLoRa::addToConfig(JsonObject& root) {
   top["macFilterEnabled"] = macFilterEnabled;  // default ON
   top["macFilterPersist"] = macFilterPersist;  // default OFF
 
+  #if DEV_TYPE == 50
+    top[F("Number of Slots (1-8)")] = numberOfSlots;
+    top[F("First Slot (1-8)")] = firstSlot;
+  #endif
+
   // masterLast3: nur persistieren, wenn Persistenz aktiv
   char m3[7+1];
   sprintf(m3, "%02X%02X%02X", masterLast3[0], masterLast3[1], masterLast3[2]);
@@ -307,6 +312,15 @@ bool UsermodGateControlLoRa::readFromConfig(JsonObject& root) {
   getJsonValue(top["groupId"], current.groupId, 0);
   getJsonValue(top["macFilterEnabled"], macFilterEnabled, true);
   getJsonValue(top["macFilterPersist"], macFilterPersist, false);
+
+  #if DEV_TYPE == 50
+    uint8_t slots = numberOfSlots;
+    uint8_t first = firstSlot;
+    getJsonValue(top[F("Number of Slots (1-8)")], slots, 1);
+    getJsonValue(top[F("First Slot (1-8)")], first, 1);
+    numberOfSlots = constrain(slots, (uint8_t)1, (uint8_t)8);
+    firstSlot = constrain(first, (uint8_t)1, (uint8_t)8);
+  #endif
 
   // Master nur aus Config übernehmen, wenn Persistenz aktiv
   if (macFilterPersist) {
@@ -561,6 +575,21 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
       } else if (p.option == 0x81) { // Reboot Node
         if (p.data0 != 0) doReboot = true;
       }
+      #if DEV_TYPE == 50
+      else if (p.option == 0x8C) { // Number of Slots
+        const uint8_t value = constrain(p.data0, (uint8_t)1, (uint8_t)8);
+        if (numberOfSlots != value) {
+          numberOfSlots = value;
+          configNeedsWrite = true;
+        }
+      } else if (p.option == 0x8D) { // First Slot
+        const uint8_t value = constrain(p.data0, (uint8_t)1, (uint8_t)8);
+        if (firstSlot != value) {
+          firstSlot = value;
+          configNeedsWrite = true;
+        }
+      }
+      #endif
       else {
         // unknown option
         break;
