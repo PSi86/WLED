@@ -61,6 +61,16 @@
   #define GC_EPAPER_MIN_REFRESH_INTERVAL_MS 10000
 #endif
 
+// Number of full-screen partial refreshes before a full refresh is enforced.
+#ifndef GC_EPAPER_PARTIAL_REFRESH_LIMIT
+  #define GC_EPAPER_PARTIAL_REFRESH_LIMIT 5
+#endif
+
+// Force a full refresh if no full refresh happened within this interval (6 min).
+#ifndef GC_EPAPER_PERIODIC_FULL_REFRESH_MS
+  #define GC_EPAPER_PERIODIC_FULL_REFRESH_MS 360000
+#endif
+
 // Optional periodic maintenance refresh (disabled by default).
 // Set to e.g. 600000 (10min) if you notice ghosting over long runtimes.
 #ifndef GC_EPAPER_MAINTENANCE_REFRESH_MS
@@ -105,7 +115,9 @@ static bool g_hasPilotData = false;
 static bool g_refreshPending = false;
 static uint32_t g_lastUpdateMs = 0;  // last received update command
 static uint32_t g_firstUpdateMs = 0; // first update command since pending started
-static uint32_t g_lastRefreshMs = 0; // last full refresh
+static uint32_t g_lastRefreshMs = 0; // last refresh (full or partial)
+static uint32_t g_lastFullRefreshMs = 0;
+static uint8_t g_partialRefreshCount = 0;
 
 // -----------------------------
 // Helpers
@@ -230,7 +242,7 @@ static void renderStartScreen()
   while (display.nextPage());
 }
 
-static void renderLayout1()
+static void renderLayout1(bool fullRefresh)
 {
   display.setRotation(1);
   const uint16_t W = display.width();
@@ -255,7 +267,8 @@ static void renderLayout1()
   const char* nickUpper = g_nick[0];
   const GFXfont* nickFont = pickFontFit(nickUpper, nickMaxW, nickMaxH);
 
-  display.setFullWindow();
+  if (fullRefresh) display.setFullWindow();
+  else display.setPartialWindow(0, 0, W, H);
   display.firstPage();
   do
   {
@@ -289,7 +302,7 @@ static void renderLayout1()
   while (display.nextPage());
 }
 
-static void renderLayoutMulti()
+static void renderLayoutMulti(bool fullRefresh)
 {
   display.setRotation(1);
   const uint16_t W = display.width();
@@ -307,7 +320,8 @@ static void renderLayoutMulti()
   const uint16_t nickMaxW = (leftW > (2 * leftPadX)) ? (leftW - 2 * leftPadX) : leftW;
   const uint16_t nickMaxH = rowH - 6;
 
-  display.setFullWindow();
+  if (fullRefresh) display.setFullWindow();
+  else display.setPartialWindow(0, 0, W, H);
   display.firstPage();
   do
   {
@@ -351,10 +365,10 @@ static void renderLayoutMulti()
   while (display.nextPage());
 }
 
-static void renderAll()
+static void renderAll(bool fullRefresh)
 {
-  if (g_numPilots <= 1) renderLayout1();
-  else renderLayoutMulti();
+  if (g_numPilots <= 1) renderLayout1(fullRefresh);
+  else renderLayoutMulti(fullRefresh);
 }
 
 static void wakeIfNeeded()
@@ -385,6 +399,24 @@ static void scheduleDeferredRefresh()
   g_lastUpdateMs = now;
 }
 
+static void performRefresh(bool fullRefresh)
+{
+  wakeIfNeeded();
+  renderAll(fullRefresh);
+  const uint32_t now = millis();
+  g_lastRefreshMs = now;
+  if (fullRefresh)
+  {
+    g_lastFullRefreshMs = now;
+    g_partialRefreshCount = 0;
+  }
+  else if (g_partialRefreshCount < 255)
+  {
+    g_partialRefreshCount++;
+  }
+  maybeHibernate();
+}
+
 // -----------------------------
 // Public API
 // -----------------------------
@@ -405,6 +437,8 @@ void epaperInit()
 
   renderStartScreen();
   g_lastRefreshMs = millis();
+  g_lastFullRefreshMs = g_lastRefreshMs;
+  g_partialRefreshCount = 0;
   maybeHibernate();
 }
 
@@ -459,27 +493,32 @@ void service_epaper()
     const bool dueByDelay = (uint32_t)(now - g_lastUpdateMs) >= (uint32_t)GC_EPAPER_REFRESH_DELAY_MS;
     const bool dueByMax   = (uint32_t)(now - g_firstUpdateMs) >= (uint32_t)GC_EPAPER_MAX_DEFER_MS;
     const bool minOk      = (uint32_t)(now - g_lastRefreshMs) >= (uint32_t)GC_EPAPER_MIN_REFRESH_INTERVAL_MS;
+    const bool periodicFullDue = (GC_EPAPER_PERIODIC_FULL_REFRESH_MS > 0) &&
+      ((uint32_t)(now - g_lastFullRefreshMs) >= (uint32_t)GC_EPAPER_PERIODIC_FULL_REFRESH_MS);
+    const bool fullRefreshDue = periodicFullDue || (g_partialRefreshCount >= GC_EPAPER_PARTIAL_REFRESH_LIMIT);
 
     if ((dueByDelay || dueByMax) && minOk)
     {
-      wakeIfNeeded();
-      renderAll();
-      g_lastRefreshMs = now;
+      performRefresh(fullRefreshDue);
       g_refreshPending = false;
-      maybeHibernate();
     }
   }
   else
   {
     // Optional periodic maintenance refresh to reduce ghosting over very long runtimes
-    if (GC_EPAPER_MAINTENANCE_REFRESH_MS > 0 && g_hasPilotData)
+    if (GC_EPAPER_PERIODIC_FULL_REFRESH_MS > 0 && g_hasPilotData)
+    {
+      const bool minOk = (uint32_t)(now - g_lastRefreshMs) >= (uint32_t)GC_EPAPER_MIN_REFRESH_INTERVAL_MS;
+      if (minOk && (uint32_t)(now - g_lastFullRefreshMs) >= (uint32_t)GC_EPAPER_PERIODIC_FULL_REFRESH_MS)
+      {
+        performRefresh(true);
+      }
+    }
+    else if (GC_EPAPER_MAINTENANCE_REFRESH_MS > 0 && g_hasPilotData)
     {
       if ((uint32_t)(now - g_lastRefreshMs) >= (uint32_t)GC_EPAPER_MAINTENANCE_REFRESH_MS)
       {
-        wakeIfNeeded();
-        renderAll();
-        g_lastRefreshMs = now;
-        maybeHibernate();
+        performRefresh(true);
       }
     }
   }
