@@ -2,7 +2,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-// LoRaProto v2.0 -- shared, header-only protocol for ESP32 + SX1262
+// LoRaProto v2.0 -- shared, header-only protocol for SX1262 / LLCC68 based LoRa nodes
 // Packet = Header7 (3B sender + 3B receiver + 1B type) + Body (0..20B)
 // Direction bit (0x80): 0 = Master->Node, 1 = Node->Master
 // Broadcast: receiver3 == FF:FF:FF
@@ -179,6 +179,25 @@ inline uint8_t build_empty(uint8_t* out, const uint8_t s3[3], const uint8_t r3[3
   Header7* h = reinterpret_cast<Header7*>(out);
   put3(h->sender, s3); put3(h->receiver, r3); h->type = full_type;
   return (uint8_t)sizeof(Header7);
+}
+
+struct StreamCtrl {
+  bool start;
+  bool stop;
+  uint8_t packets_left;
+};
+
+inline uint8_t encode_stream_ctrl(bool start, bool stop, uint8_t packets_left) {
+  uint8_t ctrl = (start ? 0x80U : 0x00U) | (stop ? 0x40U : 0x00U);
+  return static_cast<uint8_t>(ctrl | (packets_left & 0x3FU));
+}
+
+inline StreamCtrl decode_stream_ctrl(uint8_t ctrl) {
+  StreamCtrl decoded{};
+  decoded.start = (ctrl & 0x80U) != 0U;
+  decoded.stop = (ctrl & 0x40U) != 0U;
+  decoded.packets_left = static_cast<uint8_t>(ctrl & 0x3FU);
+  return decoded;
 }
 
 } // namespace LoraProto

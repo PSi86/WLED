@@ -73,10 +73,22 @@
   #define GC_EPAPER_USE_HIBERNATE 1
 #endif
 
-// 2.9\" EPD Module (B/W)
+// Dedicated SPI bus for ePaper (keep LoRa on default SPI)
+#if defined(HSPI)
+static SPIClass epdSPI(HSPI);
+#else
+static SPIClass epdSPI;
+#endif
+
+// 2.9'' EPD Module (B/W), DEPG0290BS 128x296, SSD1680
 static GxEPD2_BW<GxEPD2_290_BS, GxEPD2_290_BS::HEIGHT> display(
   GxEPD2_290_BS(/*CS=*/ GC_EPAPER_CS, /*DC=*/ GC_EPAPER_DC, /*RES=*/ GC_EPAPER_RST, /*BUSY=*/ GC_EPAPER_BUSY)
 );
+
+// 3.7'' EPD Module, GDEY037T03 240x416, UC8253
+//static GxEPD2_BW<GxEPD2_370_GDEY037T03, GxEPD2_370_GDEY037T03::HEIGHT> display(
+//  GxEPD2_370_GDEY037T03(/*CS=5*/ GC_EPAPER_CS, /*DC=*/ GC_EPAPER_DC, /*RES=*/ GC_EPAPER_RST, /*BUSY=*/ GC_EPAPER_BUSY)
+//);
 
 // -----------------------------
 // State
@@ -378,7 +390,8 @@ static void scheduleDeferredRefresh()
 // -----------------------------
 void epaperInit()
 {
-  SPI.begin(GC_EPAPER_SCK, GC_EPAPER_MISO, GC_EPAPER_MOSI, GC_EPAPER_CS);
+  epdSPI.begin(GC_EPAPER_SCK, GC_EPAPER_MISO, GC_EPAPER_MOSI, GC_EPAPER_CS);
+  display.epd2.selectSPI(epdSPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));
   display.init(115200, true, 50, false);
   g_initialized = true;
   g_hibernated = false;

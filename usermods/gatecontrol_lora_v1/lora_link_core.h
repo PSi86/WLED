@@ -133,6 +133,24 @@ struct Core {
   uint16_t  txCount       = 0;
   uint32_t  lastTxAtMs    = 0;
 
+  // --- Stream state (max 16 packets * 8 bytes = 128 bytes) ---
+  enum class StreamMode : uint8_t { None, Rx, Tx };
+  StreamMode streamMode          = StreamMode::None;
+  bool      streamActive         = false;
+  bool      streamReady          = false;
+  bool      streamLastScheduled  = false;
+  uint8_t   streamBuf[128]       = {0};
+  uint8_t   streamLen            = 0;
+  uint8_t   streamOffset         = 0;
+  uint8_t   streamLastPacketsLeft = 0;
+  uint8_t   streamTotalPackets   = 0;
+  uint8_t   streamIndex          = 0;
+  uint16_t  streamPostRxMs       = 0;
+  int8_t    streamPostRxNumWanted = -1;
+  uint8_t   streamDst3[3]        = {0};
+  uint8_t   streamSrc3[3]        = {0};
+  uint8_t   streamType           = 0;
+
   // --- LBT / Arbiter / ToA ---
   bool       lbtEnable   = true;                // im Setup setzen
   bool       lbtRxRelax  = true;              // LBT-Backoff (µs)
@@ -207,51 +225,6 @@ inline bool receiverMatches(const uint8_t receiver3[3], const uint8_t myLast3[3]
   return isBroadcast3(receiver3) || same3(receiver3, myLast3);
 }
 
-// -------------------- Radio initialization common code --------------------
-#if defined(GATE_LORA_SX1262)
-inline bool beginCommon(SX1262& radio, Core& ll, const PhyCfg& cfg) {
-#elif defined(GATE_LORA_LLCC68)
-inline bool beginCommon(LLCC68& radio, Core& ll, const PhyCfg& cfg) {
-#else
-  #error "No LoRa radio module defined"
-#endif
-//inline bool beginCommon(SX1262& radio, Core& ll, const PhyCfg& cfg) {
-  const int8_t power = (cfg.txPowerDbm == INT8_MIN) ? 14 : cfg.txPowerDbm;
-
-  int16_t st = radio.begin(cfg.freqMHz, cfg.bwKHz, cfg.sf, cfg.crDen,
-                           cfg.syncWord, power, cfg.preamble);
-  if (st != RADIOLIB_ERR_NONE) return false;
-
-  if (cfg.crcOn) radio.setCRC(true); else radio.setCRC(false);
-  if (cfg.dio2RfSwitch != -1) radio.setDio2AsRfSwitch(cfg.dio2RfSwitch == 1);
-  if (cfg.rxBoost != -1)      radio.setRxBoostedGainMode(cfg.rxBoost == 1);
-
-  radio.standby();        // ensure standby after init
-
-  if(readEfuseMac6(ll.myMac6)) {
-    ll.macReadOK = true;
-    last3FromMac6(ll.myLast3, ll.myMac6);
-  }
-  
-  ll.radio = &radio;
-  ll.toaUsMax17 = radio.getTimeOnAir(16);   // µs // 51ms for 16B @ SF7BW125CR45
-  g_ll = &ll;
-
-  return true;
-}
-
-#if defined(GATE_LORA_SX1262)
-inline void attachDio1(SX1262& radio, Core& ll) {
-  radio.setDio1Action(onDio1ISR_trampoline);
-}
-#elif defined(GATE_LORA_LLCC68)
-inline void attachDio1(LLCC68& radio, Core& ll) {
-  radio.setDio1Action(onDio1ISR_trampoline);
-}
-#else
-#error "No LoRa radio module defined"
-#endif
-
 // Maximaler LBT-Backoff in Millisekunden basierend auf time-on-air für das längste Paket
 // (für 17-Byte-Paket ca. 51 ms bei SF7BW125CR45)
 inline uint16_t lbtBackoffMaxMs(const Core& ll) {
@@ -278,23 +251,23 @@ inline void setDefaultIdle(Core& ll) {
 inline void setDefaultRxContinuous(Core& ll) {
   ll.defaultRxKind = RxKind::Continuous;
   ll.defaultRxMs   = 0; // echt kontinuierlich
-  ll.reqRxKind = RxKind::Continuous; 
+  ll.reqRxKind = RxKind::Continuous;
   ll.reqRxMs = 0;
 }
 inline void requestRxTimed(Core& ll, uint16_t windowMs, int8_t rxNumWanted = -1) {
-  ll.reqRxKind = RxKind::Timed; 
+  ll.reqRxKind = RxKind::Timed;
   ll.reqRxMs = windowMs;
   ll.rxNumWanted = rxNumWanted;
   ll.changeMode = true; // force window (re)open even if already in Timed RX
 }
 inline void requestRxContinuous(Core& ll) {
-  ll.reqRxKind = RxKind::Continuous; 
+  ll.reqRxKind = RxKind::Continuous;
   ll.reqRxMs = 0;
 }
 inline void cancelRxRequest(Core& ll) {
   ll.changeMode = true;
   ll.rfMode = Mode::Idle;
-  ll.reqRxKind = RxKind::None; 
+  ll.reqRxKind = RxKind::None;
   ll.reqRxMs = 0;
 }
 
@@ -360,6 +333,162 @@ inline bool buildEmptyAndSchedule(Core& ll, const uint8_t my3[3], const uint8_t 
   return scheduleSend(ll, out, n);
 }
 
+// -------------------- Stream helpers --------------------
+enum class StreamStatus : uint8_t { StreamStart, StreamContinue, StreamEnd, Error };
+
+inline const uint8_t* streamBuffer(const Core& ll, uint8_t& len) {
+  len = ll.streamLen;
+  return ll.streamBuf;
+}
+
+inline void clearStreamReady(Core& ll) {
+  ll.streamReady = false;
+}
+
+inline bool scheduleStreamSend(Core& ll, const uint8_t* data, uint8_t len,
+                               const uint8_t src3[3], const uint8_t dst3[3],
+                               uint8_t fullType, uint16_t rxMs, int8_t rxNumWanted = 1) {
+  constexpr uint8_t kChunkLen = sizeof(LoraProto::P_Stream::data);
+  constexpr uint8_t kMaxLen = 16 * kChunkLen;
+  if (ll.streamActive || ll.txPending || ll.streamMode != Core::StreamMode::None) return false;
+  if (!data || len == 0 || len > kMaxLen) return false;
+  if ((len % kChunkLen) != 0) return false;
+  const uint8_t totalPackets = static_cast<uint8_t>(len / kChunkLen);
+  if (totalPackets < 2 || totalPackets > 16) return false;
+
+  memcpy(ll.streamBuf, data, len);
+  ll.streamMode = Core::StreamMode::Tx;
+  ll.streamActive = true;
+  ll.streamReady = false;
+  ll.streamLastScheduled = false;
+  ll.streamLen = len;
+  ll.streamOffset = 0;
+  ll.streamTotalPackets = totalPackets;
+  ll.streamIndex = 0;
+  ll.streamPostRxMs = rxMs;
+  ll.streamPostRxNumWanted = rxNumWanted;
+  ll.streamType = fullType;
+  memcpy(ll.streamDst3, dst3, sizeof(ll.streamDst3));
+  memcpy(ll.streamSrc3, src3, sizeof(ll.streamSrc3));
+  return true;
+}
+
+inline bool queueNextStreamPacket(Core& ll) {
+  constexpr uint8_t kChunkLen = sizeof(LoraProto::P_Stream::data);
+  if (ll.streamMode != Core::StreamMode::Tx || !ll.streamActive || ll.txPending) return false;
+  if (ll.streamIndex >= ll.streamTotalPackets) return false;
+
+  const bool isStart = (ll.streamIndex == 0);
+  const bool isStop = (ll.streamIndex == static_cast<uint8_t>(ll.streamTotalPackets - 1));
+  const uint8_t packetsLeft = static_cast<uint8_t>((ll.streamTotalPackets - 1) - ll.streamIndex);
+
+  LoraProto::P_Stream p{};
+  p.ctrl = LoraProto::encode_stream_ctrl(isStart, isStop, packetsLeft);
+  memcpy(p.data, &ll.streamBuf[ll.streamOffset], kChunkLen);
+
+  uint8_t out[sizeof(LoraProto::Header7) + sizeof(LoraProto::P_Stream)];
+  uint8_t n = LoraProto::build(out, ll.streamSrc3, ll.streamDst3, ll.streamType, p);
+  if (!scheduleSend(ll, out, n, 0)) return false;
+
+  ll.streamOffset += kChunkLen;
+  ++ll.streamIndex;
+  ll.streamLastScheduled = isStop;
+  return true;
+}
+
+inline StreamStatus handleStreamPacket(Core& ll, const LoraProto::P_Stream& pkt) {
+  constexpr uint8_t kStreamDataLen = sizeof(pkt.data);
+  constexpr uint8_t kMaxPackets = 16;
+  const LoraProto::StreamCtrl ctrl = LoraProto::decode_stream_ctrl(pkt.ctrl);
+
+  if (ctrl.packets_left >= kMaxPackets) return StreamStatus::Error;
+  if (ll.streamMode == Core::StreamMode::Tx) return StreamStatus::Error;
+
+  if (ctrl.start) {
+    if (ctrl.stop || ctrl.packets_left == 0) return StreamStatus::Error;
+    ll.streamMode = Core::StreamMode::Rx;
+    ll.streamActive = true;
+    ll.streamReady = false;
+    ll.streamLen = 0;
+    ll.streamOffset = 0;
+    ll.streamLastPacketsLeft = ctrl.packets_left;
+    if (ll.streamOffset + kStreamDataLen > sizeof(ll.streamBuf)) return StreamStatus::Error;
+    memcpy(&ll.streamBuf[ll.streamOffset], pkt.data, kStreamDataLen);
+    ll.streamOffset += kStreamDataLen;
+    ll.streamLen = ll.streamOffset;
+    return StreamStatus::StreamStart;
+  }
+
+  if (!ll.streamActive) return StreamStatus::Error;
+
+  if (ctrl.stop) {
+    if (ctrl.packets_left != 0 || ll.streamLastPacketsLeft != 1) return StreamStatus::Error;
+    if (ll.streamOffset + kStreamDataLen > sizeof(ll.streamBuf)) return StreamStatus::Error;
+    memcpy(&ll.streamBuf[ll.streamOffset], pkt.data, kStreamDataLen);
+    ll.streamOffset += kStreamDataLen;
+    ll.streamLen = ll.streamOffset;
+    ll.streamActive = false;
+    ll.streamReady = true;
+    ll.streamLastPacketsLeft = 0;
+    ll.streamMode = Core::StreamMode::None;
+    return StreamStatus::StreamEnd;
+  }
+
+  if (ctrl.packets_left == 0) return StreamStatus::Error;
+  if (ctrl.packets_left != static_cast<uint8_t>(ll.streamLastPacketsLeft - 1)) return StreamStatus::Error;
+  if (ll.streamOffset + kStreamDataLen > sizeof(ll.streamBuf)) return StreamStatus::Error;
+  memcpy(&ll.streamBuf[ll.streamOffset], pkt.data, kStreamDataLen);
+  ll.streamOffset += kStreamDataLen;
+  ll.streamLen = ll.streamOffset;
+  ll.streamLastPacketsLeft = ctrl.packets_left;
+  return StreamStatus::StreamContinue;
+}
+
+// -------------------- Radio initialization common code --------------------
+#if defined(GATE_LORA_SX1262)
+inline bool beginCommon(SX1262& radio, Core& ll, const PhyCfg& cfg) {
+#elif defined(GATE_LORA_LLCC68)
+inline bool beginCommon(LLCC68& radio, Core& ll, const PhyCfg& cfg) {
+#else
+  #error "No LoRa radio module defined"
+#endif
+//inline bool beginCommon(SX1262& radio, Core& ll, const PhyCfg& cfg) {
+  const int8_t power = (cfg.txPowerDbm == INT8_MIN) ? 14 : cfg.txPowerDbm;
+
+  int16_t st = radio.begin(cfg.freqMHz, cfg.bwKHz, cfg.sf, cfg.crDen,
+                           cfg.syncWord, power, cfg.preamble);
+  if (st != RADIOLIB_ERR_NONE) return false;
+
+  if (cfg.crcOn) radio.setCRC(true); else radio.setCRC(false);
+  if (cfg.dio2RfSwitch != -1) radio.setDio2AsRfSwitch(cfg.dio2RfSwitch == 1);
+  if (cfg.rxBoost != -1)      radio.setRxBoostedGainMode(cfg.rxBoost == 1);
+
+  radio.standby();        // ensure standby after init
+
+  if(readEfuseMac6(ll.myMac6)) {
+    ll.macReadOK = true;
+    last3FromMac6(ll.myLast3, ll.myMac6);
+  }
+  
+  ll.radio = &radio;
+  ll.toaUsMax17 = radio.getTimeOnAir(16);   // µs // 51ms for 16B @ SF7BW125CR45
+  g_ll = &ll;
+
+  return true;
+}
+
+#if defined(GATE_LORA_SX1262)
+inline void attachDio1(SX1262& radio, Core& ll) {
+  radio.setDio1Action(onDio1ISR_trampoline);
+}
+#elif defined(GATE_LORA_LLCC68)
+inline void attachDio1(LLCC68& radio, Core& ll) {
+  radio.setDio1Action(onDio1ISR_trampoline);
+}
+#else
+#error "No LoRa radio module defined"
+#endif
+
 // -------------------- The service pump (call in loop()) --------------------
 inline void service(Core& ll, const Callbacks& cb) {
   const uint32_t now = millis();
@@ -402,6 +531,11 @@ inline void service(Core& ll, const Callbacks& cb) {
       } */
     }
   }
+
+  if (!ll.txPending && ll.streamMode == Core::StreamMode::Tx && ll.streamActive) {
+    queueNextStreamPacket(ll);
+  }
+
   // (B) Wenn im Idle, dann gewünschten Modus prüfen und wechseln
   if(ll.rfMode == Mode::Idle) {
     // Idle → gewünschten Modus prüfen
@@ -492,6 +626,22 @@ inline void service(Core& ll, const Callbacks& cb) {
         //ll.debug = 100;
         if (cb.onTxDone) cb.onTxDone(cb.ctx);        
         
+        if (ll.streamMode == Core::StreamMode::Tx && ll.streamLastScheduled) {
+          ll.streamMode = Core::StreamMode::None;
+          ll.streamActive = false;
+          ll.streamLastScheduled = false;
+          ll.streamLen = 0;
+          ll.streamOffset = 0;
+          ll.streamTotalPackets = 0;
+          ll.streamIndex = 0;
+          ll.streamType = 0;
+          if (ll.streamPostRxMs > 0) {
+            requestRxTimed(ll, ll.streamPostRxMs, ll.streamPostRxNumWanted);
+          }
+          ll.streamPostRxMs = 0;
+          ll.streamPostRxNumWanted = -1;
+        }
+
         ll.rfMode = Mode::Idle;
         ll.changeMode = true;
 
