@@ -1,3 +1,5 @@
+#ifdef GC_EPAPER
+
 #include "gc_epaper.h"
 #include <SPI.h>
 
@@ -523,3 +525,5 @@ void service_epaper()
     }
   }
 }
+
+#endif
