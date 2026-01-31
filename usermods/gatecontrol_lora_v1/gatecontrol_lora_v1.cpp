@@ -501,6 +501,9 @@ bool UsermodGateControlLoRa::handleStreamPacket(const uint8_t* buf, uint8_t len,
         "[GateLoRa] STREAM Startblock v1 slot %u chan %s name %s",
         startblock.slot, startblock.chan, nameBuf);
       DEBUG_PRINTLN(logBuf);
+#ifdef GC_EPAPER
+      setPilotSlotData(nameBuf, startblock.chan, startblock.slot);
+#endif
     } else {
       DEBUG_PRINTLN(F("[GateLoRa] STREAM Startblock v1 parse failed"));
     }
