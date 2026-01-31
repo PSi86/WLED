@@ -18,6 +18,33 @@ static uint16_t debugCounter = 0;
 
 static const char HEXLUT[] = "0123456789ABCDEF";
 
+struct StartblockMsgV1 {
+  uint8_t  slot;      // 1..4
+  char     chan[3];   // "R1", null-terminated
+  const uint8_t* name_ptr;
+  uint8_t  name_len;
+};
+
+static bool parseStartblockV1(const uint8_t* data, size_t len, StartblockMsgV1& out) {
+  if (!data || len < 5) return false;
+
+  size_t pos = 0;
+  uint8_t ver = data[pos++];
+  if (ver != 0x01) return false;
+
+  out.slot = data[pos++];
+
+  out.chan[0] = (char)data[pos++];   // fixed 2 bytes
+  out.chan[1] = (char)data[pos++];
+  out.chan[2] = '\0';
+
+  out.name_len = data[pos++];        // uint8
+  if (pos + out.name_len > len) return false;
+
+  out.name_ptr = &data[pos];
+  return true;
+}
+
 static inline void captureLastRxPacket(const uint8_t* buf, size_t len) {
   if (!buf) { lastRxLen = 0; lastRxHex[0] = '\0'; return; }
 
@@ -461,6 +488,22 @@ bool UsermodGateControlLoRa::handleStreamPacket(const uint8_t* buf, uint8_t len,
   if (streamReceivedMask == expectedMask) {
     streamLength = (uint16_t)(totalPackets * STREAM_CHUNK_SIZE);
     sendAckTo(senderLast3, OPC_STREAM, ACK_OK);
+    StartblockMsgV1 startblock{};
+    if (parseStartblockV1(streamBuffer, streamLength, startblock)) {
+      char nameBuf[STREAM_BUFFER_SIZE];
+      size_t nameLen = startblock.name_len;
+      if (nameLen >= sizeof(nameBuf)) nameLen = sizeof(nameBuf) - 1;
+      memcpy(nameBuf, startblock.name_ptr, nameLen);
+      nameBuf[nameLen] = '\0';
+
+      char logBuf[160];
+      snprintf(logBuf, sizeof(logBuf),
+        "[GateLoRa] STREAM Startblock v1 slot %u chan %s name %s",
+        startblock.slot, startblock.chan, nameBuf);
+      DEBUG_PRINTLN(logBuf);
+    } else {
+      DEBUG_PRINTLN(F("[GateLoRa] STREAM Startblock v1 parse failed"));
+    }
     streamReceivedMask = 0;
     streamTotalPackets = 0;
     streamLength = 0;
