@@ -246,9 +246,4 @@ private:
   void handleSync(uint32_t ts24, uint8_t briFromPkt);
 
   bool handleStreamPacket(const uint8_t* buf, uint8_t len, const uint8_t senderLast3[3]);
-
-  uint8_t streamBuffer[STREAM_BUFFER_SIZE] = {0};
-  uint8_t streamReceivedMask = 0;
-  uint8_t streamTotalPackets = 0;
-  uint16_t streamLength = 0;
 };

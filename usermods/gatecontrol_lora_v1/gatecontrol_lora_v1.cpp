@@ -462,58 +462,38 @@ bool UsermodGateControlLoRa::handleStreamPacket(const uint8_t* buf, uint8_t len,
   using namespace LoraProto;
   if (len != (sizeof(Header7) + sizeof(P_Stream))) return false;
 
-  const uint8_t* body = buf + sizeof(Header7);
-  const uint8_t ctrl = body[0];
-  const uint8_t totalPackets = (uint8_t)((ctrl >> 4) & 0x0F);
-  const uint8_t packetIndex = (uint8_t)(ctrl & 0x0F);
+  P_Stream p{};
+  if (!parseBody(buf, len, p)) return false;
 
-  if (totalPackets == 0 || totalPackets > STREAM_MAX_PACKETS) return false;
-  if (packetIndex >= totalPackets) return false;
+  const LoraLink::StreamStatus status = LoraLink::handleStreamPacket(ll, p);
+  if (status != LoraLink::StreamStatus::StreamEnd) return false;
 
-  const uint8_t dataLen = STREAM_CHUNK_SIZE;
+  sendAckTo(senderLast3, OPC_STREAM, ACK_OK);
 
-  if (packetIndex == 0 || totalPackets != streamTotalPackets) {
-    streamReceivedMask = 0;
-    streamTotalPackets = totalPackets;
-    streamLength = 0;
-  }
+  uint8_t streamLen = 0;
+  const uint8_t* streamData = LoraLink::streamBuffer(ll, streamLen);
+  StartblockMsgV1 startblock{};
+  if (parseStartblockV1(streamData, streamLen, startblock)) {
+    char nameBuf[STREAM_BUFFER_SIZE];
+    size_t nameLen = startblock.name_len;
+    if (nameLen >= sizeof(nameBuf)) nameLen = sizeof(nameBuf) - 1;
+    memcpy(nameBuf, startblock.name_ptr, nameLen);
+    nameBuf[nameLen] = '\0';
 
-  const uint16_t offset = (uint16_t)packetIndex * STREAM_CHUNK_SIZE;
-  if (offset + dataLen > STREAM_BUFFER_SIZE) return false;
-
-  memcpy(streamBuffer + offset, body + 1, dataLen);
-  streamReceivedMask |= (uint8_t)(1u << packetIndex);
-
-  const uint8_t expectedMask = (uint8_t)((1u << totalPackets) - 1u);
-  if (streamReceivedMask == expectedMask) {
-    streamLength = (uint16_t)(totalPackets * STREAM_CHUNK_SIZE);
-    sendAckTo(senderLast3, OPC_STREAM, ACK_OK);
-    StartblockMsgV1 startblock{};
-    if (parseStartblockV1(streamBuffer, streamLength, startblock)) {
-      char nameBuf[STREAM_BUFFER_SIZE];
-      size_t nameLen = startblock.name_len;
-      if (nameLen >= sizeof(nameBuf)) nameLen = sizeof(nameBuf) - 1;
-      memcpy(nameBuf, startblock.name_ptr, nameLen);
-      nameBuf[nameLen] = '\0';
-
-      char logBuf[160];
-      snprintf(logBuf, sizeof(logBuf),
-        "[GateLoRa] STREAM Startblock v1 slot %u chan %s name %s",
-        startblock.slot, startblock.chan, nameBuf);
-      DEBUG_PRINTLN(logBuf);
+    char logBuf[160];
+    snprintf(logBuf, sizeof(logBuf),
+      "[GateLoRa] STREAM Startblock v1 slot %u chan %s name %s",
+      startblock.slot, startblock.chan, nameBuf);
+    DEBUG_PRINTLN(logBuf);
 #ifdef GC_EPAPER
-      setPilotSlotData(nameBuf, startblock.chan, startblock.slot);
+    setPilotSlotData(nameBuf, startblock.chan, startblock.slot);
 #endif
-    } else {
-      DEBUG_PRINTLN(F("[GateLoRa] STREAM Startblock v1 parse failed"));
-    }
-    streamReceivedMask = 0;
-    streamTotalPackets = 0;
-    streamLength = 0;
-    return true;
+  } else {
+    DEBUG_PRINTLN(F("[GateLoRa] STREAM Startblock v1 parse failed"));
   }
 
-  return false;
+  LoraLink::clearStreamReady(ll);
+  return true;
 }
 
 void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
