@@ -438,7 +438,7 @@ bool UsermodGateControlLoRa::senderAllowed(const uint8_t s3[3], uint8_t opcode7)
     return (opcode7 == OPC_DEVICES || opcode7 == OPC_SET_GROUP);
   }
   // danach nur noch vom gelernten Master zulassen
-  return (s3[0]==masterLast3[0] && s3[1]==masterLast3[1] && s3[2]==masterLast3[2]);
+  return LoraLink::same3(s3, masterLast3);
 }
 
 void UsermodGateControlLoRa::learnMasterFromSender(const uint8_t s3[3], bool persistIfEnabled) {
