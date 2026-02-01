@@ -110,6 +110,9 @@ void UsermodGateControlLoRa::setup() {
   
   #ifdef GC_EPAPER
     epaperInit();
+    #if DEV_TYPE == 50
+      setDisplayLayout(numberOfSlots);
+    #endif
   #endif
 }
 
@@ -347,6 +350,9 @@ bool UsermodGateControlLoRa::readFromConfig(JsonObject& root) {
     getJsonValue(top[F("First Slot (1-8)")], first, 1);
     numberOfSlots = constrain(slots, (uint8_t)1, (uint8_t)8);
     firstSlot = constrain(first, (uint8_t)1, (uint8_t)8);
+    #ifdef GC_EPAPER
+      setDisplayLayout(numberOfSlots);
+    #endif
   #endif
 
   // Master nur aus Config übernehmen, wenn Persistenz aktiv
@@ -486,7 +492,20 @@ bool UsermodGateControlLoRa::handleStreamPacket(const uint8_t* buf, uint8_t len,
       startblock.slot, startblock.chan, nameBuf);
     DEBUG_PRINTLN(logBuf);
 #ifdef GC_EPAPER
-    setPilotSlotData(nameBuf, startblock.chan, startblock.slot);
+    bool slotValid = true;
+    uint8_t displaySlot = startblock.slot;
+    #if DEV_TYPE == 50
+      const uint8_t slotCount = constrain(numberOfSlots, (uint8_t)1, (uint8_t)8);
+      const uint8_t slotFirst = constrain(firstSlot, (uint8_t)1, (uint8_t)8);
+      if (startblock.slot < slotFirst || startblock.slot >= (uint8_t)(slotFirst + slotCount)) {
+        slotValid = false;
+      } else {
+        displaySlot = startblock.slot - slotFirst + 1;
+      }
+    #endif
+    if (slotValid && displaySlot <= 4) {
+      setPilotSlotData(nameBuf, startblock.chan, displaySlot);
+    }
 #endif
   } else {
     DEBUG_PRINTLN(F("[GateLoRa] STREAM Startblock v1 parse failed"));
@@ -606,6 +625,9 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
         const uint8_t value = constrain(p.data0, (uint8_t)1, (uint8_t)8);
         if (numberOfSlots != value) {
           numberOfSlots = value;
+          #ifdef GC_EPAPER
+            setDisplayLayout(numberOfSlots);
+          #endif
           configNeedsWrite = true;
         }
       } else if (p.option == 0x8D) { // First Slot
