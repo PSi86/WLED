@@ -14,6 +14,12 @@ static volatile uint8_t lastRxLen = 0;        // volatile: wird in anderem Konte
 static char lastRxHex[(64 * 3) + 1];          // "FF " * 64 + '\0'
 //static uint32_t lastRxSeenMs = 0;
 
+static constexpr size_t STREAM_INFO_MAX = 128; // keep aligned with STREAM_BUFFER_SIZE
+static uint8_t lastStreamRaw[STREAM_INFO_MAX];
+static volatile uint8_t lastStreamLen = 0;
+static char lastStreamHex[(STREAM_INFO_MAX * 3) + 1];
+static uint32_t lastStreamAtMs = 0;
+
 static uint16_t debugCounter = 0;
 
 static const char HEXLUT[] = "0123456789ABCDEF";
@@ -67,6 +73,26 @@ static inline void captureLastRxPacket(const uint8_t* buf, size_t len) {
   else   *p = '\0';
 }
 
+static inline void captureLastStreamPacket(const uint8_t* buf, size_t len) {
+  if (!buf) { lastStreamLen = 0; lastStreamHex[0] = '\0'; lastStreamAtMs = 0; return; }
+
+  size_t n = (len > STREAM_INFO_MAX) ? STREAM_INFO_MAX : len;
+
+  memcpy(lastStreamRaw, buf, n);
+  lastStreamLen = (uint8_t)n;
+  lastStreamAtMs = millis();
+
+  char* p = lastStreamHex;
+  for (size_t i = 0; i < n; ++i) {
+    uint8_t b = lastStreamRaw[i];
+    *p++ = HEXLUT[b >> 4];
+    *p++ = HEXLUT[b & 0x0F];
+    *p++ = ' ';
+  }
+  if (n) *(p - 1) = '\0';
+  else   *p = '\0';
+}
+
 // ======= um_data_t helpers =======
 template<typename T>
 static inline bool um_read(const um_data_t* d, uint8_t idx, um_types_t expected, T& out) {
@@ -110,6 +136,9 @@ void UsermodGateControlLoRa::setup() {
   
   #ifdef GC_EPAPER
     epaperInit();
+    #if DEV_TYPE == 50
+      setDisplayLayout(numberOfSlots);
+    #endif
   #endif
 }
 
@@ -187,6 +216,21 @@ void UsermodGateControlLoRa::addToJsonInfo(JsonObject& root) {
       JsonArray rowHex = user.createNestedArray(F("Last RX Hex"));
       if (lastRxLen == 0) rowHex.add(F("(none)"));
       else                rowHex.add(lastRxHex);
+    }
+  }
+
+  {
+    JsonArray row = user.createNestedArray(F("Last Stream"));
+    if (lastStreamLen == 0) {
+      row.add(F("(none)"));
+    } else {
+      char meta[32];
+      uint32_t age = (millis() - lastStreamAtMs) / 1000;
+      snprintf(meta, sizeof(meta), "%uB (%lus ago)", lastStreamLen, (unsigned long)age);
+      row.add(meta);
+
+      JsonArray rowHex = user.createNestedArray(F("Last Stream Hex"));
+      rowHex.add(lastStreamHex);
     }
   }
 
@@ -347,6 +391,9 @@ bool UsermodGateControlLoRa::readFromConfig(JsonObject& root) {
     getJsonValue(top[F("First Slot (1-8)")], first, 1);
     numberOfSlots = constrain(slots, (uint8_t)1, (uint8_t)8);
     firstSlot = constrain(first, (uint8_t)1, (uint8_t)8);
+    #ifdef GC_EPAPER
+      setDisplayLayout(numberOfSlots);
+    #endif
   #endif
 
   // Master nur aus Config übernehmen, wenn Persistenz aktiv
@@ -438,7 +485,7 @@ bool UsermodGateControlLoRa::senderAllowed(const uint8_t s3[3], uint8_t opcode7)
     return (opcode7 == OPC_DEVICES || opcode7 == OPC_SET_GROUP);
   }
   // danach nur noch vom gelernten Master zulassen
-  return (s3[0]==masterLast3[0] && s3[1]==masterLast3[1] && s3[2]==masterLast3[2]);
+  return LoraLink::same3(s3, masterLast3);
 }
 
 void UsermodGateControlLoRa::learnMasterFromSender(const uint8_t s3[3], bool persistIfEnabled) {
@@ -462,58 +509,52 @@ bool UsermodGateControlLoRa::handleStreamPacket(const uint8_t* buf, uint8_t len,
   using namespace LoraProto;
   if (len != (sizeof(Header7) + sizeof(P_Stream))) return false;
 
-  const uint8_t* body = buf + sizeof(Header7);
-  const uint8_t ctrl = body[0];
-  const uint8_t totalPackets = (uint8_t)((ctrl >> 4) & 0x0F);
-  const uint8_t packetIndex = (uint8_t)(ctrl & 0x0F);
+  P_Stream p{};
+  if (!parseBody(buf, len, p)) return false;
 
-  if (totalPackets == 0 || totalPackets > STREAM_MAX_PACKETS) return false;
-  if (packetIndex >= totalPackets) return false;
+  const LoraLink::StreamStatus status = LoraLink::handleStreamPacket(ll, p);
+  if (status != LoraLink::StreamStatus::StreamEnd) return false;
 
-  const uint8_t dataLen = STREAM_CHUNK_SIZE;
+  sendAckTo(senderLast3, OPC_STREAM, ACK_OK);
 
-  if (packetIndex == 0 || totalPackets != streamTotalPackets) {
-    streamReceivedMask = 0;
-    streamTotalPackets = totalPackets;
-    streamLength = 0;
-  }
+  uint8_t streamLen = 0;
+  const uint8_t* streamData = LoraLink::streamBuffer(ll, streamLen);
+  captureLastStreamPacket(streamData, streamLen);
+  StartblockMsgV1 startblock{};
+  if (parseStartblockV1(streamData, streamLen, startblock)) {
+    char nameBuf[STREAM_BUFFER_SIZE];
+    size_t nameLen = startblock.name_len;
+    if (nameLen >= sizeof(nameBuf)) nameLen = sizeof(nameBuf) - 1;
+    memcpy(nameBuf, startblock.name_ptr, nameLen);
+    nameBuf[nameLen] = '\0';
 
-  const uint16_t offset = (uint16_t)packetIndex * STREAM_CHUNK_SIZE;
-  if (offset + dataLen > STREAM_BUFFER_SIZE) return false;
-
-  memcpy(streamBuffer + offset, body + 1, dataLen);
-  streamReceivedMask |= (uint8_t)(1u << packetIndex);
-
-  const uint8_t expectedMask = (uint8_t)((1u << totalPackets) - 1u);
-  if (streamReceivedMask == expectedMask) {
-    streamLength = (uint16_t)(totalPackets * STREAM_CHUNK_SIZE);
-    sendAckTo(senderLast3, OPC_STREAM, ACK_OK);
-    StartblockMsgV1 startblock{};
-    if (parseStartblockV1(streamBuffer, streamLength, startblock)) {
-      char nameBuf[STREAM_BUFFER_SIZE];
-      size_t nameLen = startblock.name_len;
-      if (nameLen >= sizeof(nameBuf)) nameLen = sizeof(nameBuf) - 1;
-      memcpy(nameBuf, startblock.name_ptr, nameLen);
-      nameBuf[nameLen] = '\0';
-
-      char logBuf[160];
-      snprintf(logBuf, sizeof(logBuf),
-        "[GateLoRa] STREAM Startblock v1 slot %u chan %s name %s",
-        startblock.slot, startblock.chan, nameBuf);
-      DEBUG_PRINTLN(logBuf);
+    char logBuf[160];
+    snprintf(logBuf, sizeof(logBuf),
+      "[GateLoRa] STREAM Startblock v1 slot %u chan %s name %s",
+      startblock.slot, startblock.chan, nameBuf);
+    DEBUG_PRINTLN(logBuf);
 #ifdef GC_EPAPER
-      setPilotSlotData(nameBuf, startblock.chan, startblock.slot);
-#endif
-    } else {
-      DEBUG_PRINTLN(F("[GateLoRa] STREAM Startblock v1 parse failed"));
+    bool slotValid = true;
+    uint8_t displaySlot = startblock.slot;
+    #if DEV_TYPE == 50
+      const uint8_t slotCount = constrain(numberOfSlots, (uint8_t)1, (uint8_t)8);
+      const uint8_t slotFirst = constrain(firstSlot, (uint8_t)1, (uint8_t)8);
+      if (startblock.slot < slotFirst || startblock.slot >= (uint8_t)(slotFirst + slotCount)) {
+        slotValid = false;
+      } else {
+        displaySlot = startblock.slot - slotFirst + 1;
+      }
+    #endif
+    if (slotValid && displaySlot <= 4) {
+      setPilotSlotData(nameBuf, startblock.chan, displaySlot);
     }
-    streamReceivedMask = 0;
-    streamTotalPackets = 0;
-    streamLength = 0;
-    return true;
+#endif
+  } else {
+    DEBUG_PRINTLN(F("[GateLoRa] STREAM Startblock v1 parse failed"));
   }
 
-  return false;
+  LoraLink::clearStreamReady(ll);
+  return true;
 }
 
 void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
@@ -626,6 +667,9 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
         const uint8_t value = constrain(p.data0, (uint8_t)1, (uint8_t)8);
         if (numberOfSlots != value) {
           numberOfSlots = value;
+          #ifdef GC_EPAPER
+            setDisplayLayout(numberOfSlots);
+          #endif
           configNeedsWrite = true;
         }
       } else if (p.option == 0x8D) { // First Slot
