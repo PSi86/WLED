@@ -14,6 +14,12 @@ static volatile uint8_t lastRxLen = 0;        // volatile: wird in anderem Konte
 static char lastRxHex[(64 * 3) + 1];          // "FF " * 64 + '\0'
 //static uint32_t lastRxSeenMs = 0;
 
+static constexpr size_t STREAM_INFO_MAX = 128; // keep aligned with STREAM_BUFFER_SIZE
+static uint8_t lastStreamRaw[STREAM_INFO_MAX];
+static volatile uint8_t lastStreamLen = 0;
+static char lastStreamHex[(STREAM_INFO_MAX * 3) + 1];
+static uint32_t lastStreamAtMs = 0;
+
 static uint16_t debugCounter = 0;
 
 static const char HEXLUT[] = "0123456789ABCDEF";
@@ -64,6 +70,26 @@ static inline void captureLastRxPacket(const uint8_t* buf, size_t len) {
     *p++ = ' ';
   }
   if (n) *(p - 1) = '\0';  // letztes Leerzeichen durch 0-terminator ersetzen
+  else   *p = '\0';
+}
+
+static inline void captureLastStreamPacket(const uint8_t* buf, size_t len) {
+  if (!buf) { lastStreamLen = 0; lastStreamHex[0] = '\0'; lastStreamAtMs = 0; return; }
+
+  size_t n = (len > STREAM_INFO_MAX) ? STREAM_INFO_MAX : len;
+
+  memcpy(lastStreamRaw, buf, n);
+  lastStreamLen = (uint8_t)n;
+  lastStreamAtMs = millis();
+
+  char* p = lastStreamHex;
+  for (size_t i = 0; i < n; ++i) {
+    uint8_t b = lastStreamRaw[i];
+    *p++ = HEXLUT[b >> 4];
+    *p++ = HEXLUT[b & 0x0F];
+    *p++ = ' ';
+  }
+  if (n) *(p - 1) = '\0';
   else   *p = '\0';
 }
 
@@ -190,6 +216,21 @@ void UsermodGateControlLoRa::addToJsonInfo(JsonObject& root) {
       JsonArray rowHex = user.createNestedArray(F("Last RX Hex"));
       if (lastRxLen == 0) rowHex.add(F("(none)"));
       else                rowHex.add(lastRxHex);
+    }
+  }
+
+  {
+    JsonArray row = user.createNestedArray(F("Last Stream"));
+    if (lastStreamLen == 0) {
+      row.add(F("(none)"));
+    } else {
+      char meta[32];
+      uint32_t age = (millis() - lastStreamAtMs) / 1000;
+      snprintf(meta, sizeof(meta), "%uB (%lus ago)", lastStreamLen, (unsigned long)age);
+      row.add(meta);
+
+      JsonArray rowHex = user.createNestedArray(F("Last Stream Hex"));
+      rowHex.add(lastStreamHex);
     }
   }
 
@@ -478,6 +519,7 @@ bool UsermodGateControlLoRa::handleStreamPacket(const uint8_t* buf, uint8_t len,
 
   uint8_t streamLen = 0;
   const uint8_t* streamData = LoraLink::streamBuffer(ll, streamLen);
+  captureLastStreamPacket(streamData, streamLen);
   StartblockMsgV1 startblock{};
   if (parseStartblockV1(streamData, streamLen, startblock)) {
     char nameBuf[STREAM_BUFFER_SIZE];

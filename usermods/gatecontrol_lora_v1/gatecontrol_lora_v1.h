@@ -60,6 +60,7 @@ enum GateCfgFlags : uint8_t {
   GC_FLAG_HAS_BRI         = 1u << 2,  // if set: CONFIG includes explicit brightness; if not set: brightness may come from SYNC (live)
   GC_FLAG_FORCE_TT0       = 1u << 3,  // if set: force transition delay to 0 when starting the preset
   GC_FLAG_FORCE_REAPPLY   = 1u << 4,  // if set: re-apply preset even if it's already active
+  GC_FLAG_OFFSET_MODE     = 1u << 5,  // if set: respect the groupDelay and groupQuotient (enable timebase offsets between groups, e.g. for staggered effects)
 };
 
 // StatusReply config byte flags
