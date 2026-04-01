@@ -60,6 +60,7 @@ enum GateCfgFlags : uint8_t {
   GC_FLAG_HAS_BRI         = 1u << 2,  // if set: CONFIG includes explicit brightness; if not set: brightness may come from SYNC (live)
   GC_FLAG_FORCE_TT0       = 1u << 3,  // if set: force transition delay to 0 when starting the preset
   GC_FLAG_FORCE_REAPPLY   = 1u << 4,  // if set: re-apply preset even if it's already active
+  GC_FLAG_OFFSET_MODE     = 1u << 5,  // if set: respect the groupDelay and groupQuotient (enable timebase offsets between groups, e.g. for staggered effects)
 };
 
 // StatusReply config byte flags
@@ -192,6 +193,11 @@ private:
   // Discovery reply target
   uint8_t targetForReplyLast3[3] = {0};
 
+  #if DEV_TYPE == 50
+    uint8_t numberOfSlots = 1;
+    uint8_t firstSlot = 1;
+  #endif
+
   // ===== Debug/Diag =====
   bool    radioReady = false;
   int16_t radioInitCode = 0;
@@ -241,9 +247,4 @@ private:
   void handleSync(uint32_t ts24, uint8_t briFromPkt);
 
   bool handleStreamPacket(const uint8_t* buf, uint8_t len, const uint8_t senderLast3[3]);
-
-  uint8_t streamBuffer[STREAM_BUFFER_SIZE] = {0};
-  uint8_t streamReceivedMask = 0;
-  uint8_t streamTotalPackets = 0;
-  uint16_t streamLength = 0;
 };

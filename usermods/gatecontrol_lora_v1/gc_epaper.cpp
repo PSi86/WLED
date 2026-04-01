@@ -1,3 +1,5 @@
+#ifdef GC_EPAPER
+
 #include "gc_epaper.h"
 #include <SPI.h>
 
@@ -38,27 +40,19 @@
   #define GC_EPAPER_MISO -1
 #endif
 
-#ifndef WLED_RELEASE_NAME
-  #define WLED_RELEASE_NAME "WLED"
-#endif
-
 // -----------------------------
 // Deferred refresh behavior
 // -----------------------------
-// Full refresh will be triggered in service_epaper() after no update was
-// received for GC_EPAPER_REFRESH_DELAY_MS.
-#ifndef GC_EPAPER_REFRESH_DELAY_MS
-  #define GC_EPAPER_REFRESH_DELAY_MS 1500
+#ifndef GC_EPAPER_MIN_DEFER_MS
+  #define GC_EPAPER_MIN_DEFER_MS 1500 // Defer refresh for at least this time to allow multiple updates to come in and be coalesced into a single refresh. Adjust based on your expected update frequency and latency requirements
 #endif
 
-// If updates keep coming, still perform a refresh after this max deferral.
 #ifndef GC_EPAPER_MAX_DEFER_MS
-  #define GC_EPAPER_MAX_DEFER_MS 4000
+  #define GC_EPAPER_MAX_DEFER_MS 4000 // If updates keep coming, still perform a refresh after this max deferral
 #endif
 
-// Safety: don't full-refresh too frequently.
 #ifndef GC_EPAPER_MIN_REFRESH_INTERVAL_MS
-  #define GC_EPAPER_MIN_REFRESH_INTERVAL_MS 10000
+  #define GC_EPAPER_MIN_REFRESH_INTERVAL_MS 10000 // Safety: don't full-refresh too frequently.
 #endif
 
 // Number of full-screen partial refreshes before a full refresh is enforced.
@@ -77,8 +71,7 @@
   #define GC_EPAPER_MAINTENANCE_REFRESH_MS 0
 #endif
 
-// Hibernate between refreshes (saves power). If you run into wake issues,
-// set to 0.
+// Hibernate between refreshes (saves power). If you run into wake issues, set to 0.
 #ifndef GC_EPAPER_USE_HIBERNATE
   #define GC_EPAPER_USE_HIBERNATE 1
 #endif
@@ -90,34 +83,42 @@ static SPIClass epdSPI(HSPI);
 static SPIClass epdSPI;
 #endif
 
-// 2.9'' EPD Module (B/W), DEPG0290BS 128x296, SSD1680
-static GxEPD2_BW<GxEPD2_290_BS, GxEPD2_290_BS::HEIGHT> display(
-  GxEPD2_290_BS(/*CS=*/ GC_EPAPER_CS, /*DC=*/ GC_EPAPER_DC, /*RES=*/ GC_EPAPER_RST, /*BUSY=*/ GC_EPAPER_BUSY)
-);
+/* 2.9'' EPD Module (B/W), DEPG0290BS 128x296, SSD1680
+GxEPD2_290_BS.h, GxEPD2_290_BS.cpp: no changes */
+// static GxEPD2_BW<GxEPD2_290_BS, GxEPD2_290_BS::HEIGHT> display(
+//   GxEPD2_290_BS(/*CS=*/ GC_EPAPER_CS, /*DC=*/ GC_EPAPER_DC, /*RES=*/ GC_EPAPER_RST, /*BUSY=*/ GC_EPAPER_BUSY)
+// );
 
-// 3.7'' EPD Module, GDEY037T03 240x416, UC8253
-//static GxEPD2_BW<GxEPD2_370_GDEY037T03, GxEPD2_370_GDEY037T03::HEIGHT> display(
-//  GxEPD2_370_GDEY037T03(/*CS=5*/ GC_EPAPER_CS, /*DC=*/ GC_EPAPER_DC, /*RES=*/ GC_EPAPER_RST, /*BUSY=*/ GC_EPAPER_BUSY)
-//);
+
+/* 3.7'' EPD Module, GDEY037T03 240x416, UC8253
+Issue: partial update (fast / normal) creates garbage display.
+GxEPD2_370_GDEY037T03.cpp: no changes
+GxEPD2_370_GDEY037T03.h:
+    static const bool hasFastPartialUpdate = false; // set this false to force full refresh always
+    static const bool useFastFullUpdate = false; // set false for extended (low) temperature range, 1005000us vs 2950000us
+*/
+static GxEPD2_BW<GxEPD2_370_GDEY037T03, GxEPD2_370_GDEY037T03::HEIGHT> display(
+ GxEPD2_370_GDEY037T03(/*CS=5*/ GC_EPAPER_CS, /*DC=*/ GC_EPAPER_DC, /*RES=*/ GC_EPAPER_RST, /*BUSY=*/ GC_EPAPER_BUSY)
+);
 
 // -----------------------------
 // State
 // -----------------------------
 static uint8_t g_numPilots = 1;
 
-static char g_nick[4][21];   // max 20 chars + NUL
-static char g_label[4][3];   // max 2 chars + NUL
+static char g_nick[8][21];   // max 20 chars + NUL
+static char g_label[8][3];   // max 2 chars + NUL
 
-static bool g_initialized = false;
-static bool g_hibernated = false;
-static bool g_hasPilotData = false;
+static bool g_initialized = false; // true once epaperInit() was called
+static bool g_hibernated = false; // true if display is currently hibernated
+static bool g_hasPilotData = false; // true once at least one pilot slot has received data
 
-static bool g_refreshPending = false;
-static uint32_t g_lastUpdateMs = 0;  // last received update command
-static uint32_t g_firstUpdateMs = 0; // first update command since pending started
+static bool g_refreshPending = false; // set to true to request a deferred refresh executed by service_epaper()
+static uint32_t g_lastNewDataMs = 0;  // last received update command
+static uint32_t g_firstNewDataMs = 0; // first update command since last refresh (used to enforce max defer time)
 static uint32_t g_lastRefreshMs = 0; // last refresh (full or partial)
-static uint32_t g_lastFullRefreshMs = 0;
-static uint8_t g_partialRefreshCount = 0;
+static uint32_t g_lastFullRefreshMs = 0; // last full refresh (used to enforce periodic full refreshes)
+static uint8_t g_partialRefreshCount = 0; // number of partial refreshes since last full refresh (used to enforce full refresh after too many partial refreshes)
 
 // -----------------------------
 // Helpers
@@ -194,7 +195,7 @@ static uint16_t computeBarWidth(const GFXfont* labelFont, uint16_t displayW)
   uint16_t tbw, tbh;
   display.getTextBounds("WW", 0, 0, &tbx, &tby, &tbw, &tbh);
 
-  const uint16_t padX = 12;
+  const uint16_t padX = 6;
   uint16_t barW = tbw + 2 * padX;
 
   if (barW < 56) barW = 56;
@@ -233,10 +234,10 @@ static void renderStartScreen()
   {
     display.fillScreen(GxEPD_WHITE);
 
-    drawCenteredText("GateControl Startblock", pickFontFit("GateControl Startblock", W - 16, (H / 2) - 4),
+    drawCenteredText("GateControl Startblock", pickFontFit("GateControl Startblock", W - 8, 30),
                      0, 0, W, H / 2, GxEPD_BLACK);
 
-    drawCenteredText(WLED_RELEASE_NAME, pickFontFit(WLED_RELEASE_NAME, W - 16, (H / 2) - 4),
+    drawCenteredText(WLED_RELEASE_NAME, pickFontFit(WLED_RELEASE_NAME, W - 8, (H / 3) - 4),
                      0, H / 2, W, H / 2, GxEPD_BLACK);
   }
   while (display.nextPage());
@@ -260,7 +261,7 @@ static void renderLayout1(bool fullRefresh)
   const uint16_t barX = W - barW;
   const uint16_t leftW = W - barW;
 
-  const uint16_t leftPadX = 10;
+  const uint16_t leftPadX = 5;
   const uint16_t nickMaxW = (leftW > (2 * leftPadX)) ? (leftW - 2 * leftPadX) : leftW;
   const uint16_t nickMaxH = H - 8;
 
@@ -316,7 +317,7 @@ static void renderLayoutMulti(bool fullRefresh)
   const uint16_t barX = W - barW;
   const uint16_t leftW = W - barW;
 
-  const uint16_t leftPadX = 10;
+  const uint16_t leftPadX = 6;
   const uint16_t nickMaxW = (leftW > (2 * leftPadX)) ? (leftW - 2 * leftPadX) : leftW;
   const uint16_t nickMaxH = rowH - 6;
 
@@ -367,7 +368,7 @@ static void renderLayoutMulti(bool fullRefresh)
 
 static void renderAll(bool fullRefresh)
 {
-  if (g_numPilots <= 1) renderLayout1(fullRefresh);
+  if (g_numPilots == 1) renderLayout1(fullRefresh);
   else renderLayoutMulti(fullRefresh);
 }
 
@@ -377,7 +378,7 @@ static void wakeIfNeeded()
   if (!g_hibernated) return;
 
   // Wake the panel without a full reset sequence
-  display.init(115200, false, 20, false);
+  display.init(115200, false, 50, false);
   g_hibernated = false;
 }
 
@@ -394,9 +395,9 @@ static void maybeHibernate()
 static void scheduleDeferredRefresh()
 {
   const uint32_t now = millis();
-  if (!g_refreshPending) g_firstUpdateMs = now;
+  if (!g_refreshPending) g_firstNewDataMs = now; // if no refresh pending, this is the first new data; otherwise, keep the original firstNewDataMs to enforce max defer time correctly
+  g_lastNewDataMs = now; // always update lastNewDataMs to enable dueByDelay calculation
   g_refreshPending = true;
-  g_lastUpdateMs = now;
 }
 
 static void performRefresh(bool fullRefresh)
@@ -424,11 +425,12 @@ void epaperInit()
 {
   epdSPI.begin(GC_EPAPER_SCK, GC_EPAPER_MISO, GC_EPAPER_MOSI, GC_EPAPER_CS);
   display.epd2.selectSPI(epdSPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));
-  display.init(115200, true, 50, false);
+
+  display.init(115200, false, 50, false); // reset duration was 50
   g_initialized = true;
   g_hibernated = false;
 
-  for (uint8_t i = 0; i < 4; i++)
+  for (uint8_t i = 0; i < 8; i++)
   {
     g_nick[i][0]  = '\0';
     g_label[i][0] = '\0';
@@ -445,11 +447,11 @@ void epaperInit()
 void setDisplayLayout(uint8_t numPilots)
 {
   if (numPilots < 1) numPilots = 1;
-  if (numPilots > 4) numPilots = 4;
+  if (numPilots > 8) numPilots = 8;
 
   g_numPilots = numPilots;
 
-  for (uint8_t i = numPilots; i < 4; i++)
+  for (uint8_t i = numPilots; i < 8; i++)
   {
     g_nick[i][0]  = '\0';
     g_label[i][0] = '\0';
@@ -461,7 +463,7 @@ void setDisplayLayout(uint8_t numPilots)
 
 bool setPilotSlotData(const char* nickname, const char* raceLabel, uint8_t slot)
 {
-  if (slot < 1 || slot > 4) return false;
+  if (slot < 1 || slot > 8) return false;
   if (slot > g_numPilots) return false;
 
   const uint8_t idx = slot - 1;
@@ -487,17 +489,29 @@ void service_epaper()
 
   const uint32_t now = millis();
 
+  const bool minOk = (uint32_t)(now - g_lastRefreshMs) >= (uint32_t)GC_EPAPER_MIN_REFRESH_INTERVAL_MS; // checked: good
+  if (!minOk) return; // enforce minimum interval between refreshes to prevent issues on some panels when refreshing too frequently
+
+  if(!g_hasPilotData) return; // no data yet, nothing to do
+
   // Deferred refresh after updates
   if (g_refreshPending)
   {
-    const bool dueByDelay = (uint32_t)(now - g_lastUpdateMs) >= (uint32_t)GC_EPAPER_REFRESH_DELAY_MS;
-    const bool dueByMax   = (uint32_t)(now - g_firstUpdateMs) >= (uint32_t)GC_EPAPER_MAX_DEFER_MS;
-    const bool minOk      = (uint32_t)(now - g_lastRefreshMs) >= (uint32_t)GC_EPAPER_MIN_REFRESH_INTERVAL_MS;
+    // Due to the complexity of ePaper refresh timing and the wide variety of panels out there, we use a simple time-based heuristic to decide when to refresh after receiving updates:
+    // dueByDelay: at least GC_EPAPER_MIN_DEFER_MS has passed since the last received update command
+    // dueByMax: at least GC_EPAPER_MAX_DEFER_MS has passed since the first received update command (prevents starvation if updates keep coming in)
+    // minOk: at least GC_EPAPER_MIN_REFRESH_INTERVAL_MS has passed since the last refresh (full or partial)
+    // periodicFullDue: if GC_EPAPER_PERIODIC_FULL_REFRESH_MS is set, a full refresh is due if at least that time has passed since the last full refresh (enforces periodic full refreshes to reduce ghosting, even if updates are infrequent)
+    // fullRefreshDue: if either periodicFullDue is true or the number of partial refreshes since the last full refresh has reached GC_EPAPER_PARTIAL_REFRESH_LIMIT, a full refresh is due; otherwise, a partial refresh is due
+
+    const bool dueByDelay = (uint32_t)(now - g_lastNewDataMs) >= (uint32_t)GC_EPAPER_MIN_DEFER_MS;
+    const bool dueByMax   = (uint32_t)(now - g_firstNewDataMs) >= (uint32_t)GC_EPAPER_MAX_DEFER_MS;
+
     const bool periodicFullDue = (GC_EPAPER_PERIODIC_FULL_REFRESH_MS > 0) &&
       ((uint32_t)(now - g_lastFullRefreshMs) >= (uint32_t)GC_EPAPER_PERIODIC_FULL_REFRESH_MS);
     const bool fullRefreshDue = periodicFullDue || (g_partialRefreshCount >= GC_EPAPER_PARTIAL_REFRESH_LIMIT);
 
-    if ((dueByDelay || dueByMax) && minOk)
+    if (dueByDelay || dueByMax)
     {
       performRefresh(fullRefreshDue);
       g_refreshPending = false;
@@ -506,15 +520,14 @@ void service_epaper()
   else
   {
     // Optional periodic maintenance refresh to reduce ghosting over very long runtimes
-    if (GC_EPAPER_PERIODIC_FULL_REFRESH_MS > 0 && g_hasPilotData)
+    if (GC_EPAPER_PERIODIC_FULL_REFRESH_MS > 0)
     {
-      const bool minOk = (uint32_t)(now - g_lastRefreshMs) >= (uint32_t)GC_EPAPER_MIN_REFRESH_INTERVAL_MS;
-      if (minOk && (uint32_t)(now - g_lastFullRefreshMs) >= (uint32_t)GC_EPAPER_PERIODIC_FULL_REFRESH_MS)
+      if ((uint32_t)(now - g_lastFullRefreshMs) >= (uint32_t)GC_EPAPER_PERIODIC_FULL_REFRESH_MS)
       {
         performRefresh(true);
       }
     }
-    else if (GC_EPAPER_MAINTENANCE_REFRESH_MS > 0 && g_hasPilotData)
+    else if (GC_EPAPER_MAINTENANCE_REFRESH_MS > 0)
     {
       if ((uint32_t)(now - g_lastRefreshMs) >= (uint32_t)GC_EPAPER_MAINTENANCE_REFRESH_MS)
       {
@@ -523,3 +536,5 @@ void service_epaper()
     }
   }
 }
+
+#endif
