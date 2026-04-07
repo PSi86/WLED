@@ -8,6 +8,17 @@
 // Broadcast: receiver3 == FF:FF:FF
 // NOTE: All multi-byte fields are little-endian.
 
+// Device Type Lookup (unused, only for reference)
+enum RL_Dev_Type : uint8_t {
+  GATEWAY_REV1 = 1,
+  NODE_WLED_REV1 = 10,
+  NODE_WLED_REV3 = 11,
+  NODE_WLED_REV4 = 12,
+  NODE_WLED_REV5 = 13,
+  NODE_WLED_STARTBLOCK_REV3 = 50
+  // Add more device types as needed
+};
+
 namespace LoraProto {
 
 // -------------------- Versioning --------------------
