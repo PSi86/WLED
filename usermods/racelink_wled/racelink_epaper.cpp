@@ -1,6 +1,6 @@
-#ifdef GC_EPAPER
+#ifdef RACELINK_EPAPER
 
-#include "gc_epaper.h"
+#include "racelink_epaper.h"
 #include <SPI.h>
 
 // base class GxEPD2_GFX can be used to pass references or pointers to the display instance as parameter, uses ~1.2k more code
@@ -16,67 +16,67 @@
 // -----------------------------
 // Pin defaults (override via PlatformIO build_flags: -D ...)
 // -----------------------------
-#ifndef GC_EPAPER_CS
-  #define GC_EPAPER_CS   10
+#ifndef RACELINK_EPAPER_CS
+  #define RACELINK_EPAPER_CS   10
 #endif
-#ifndef GC_EPAPER_BUSY
-  #define GC_EPAPER_BUSY 3
+#ifndef RACELINK_EPAPER_BUSY
+  #define RACELINK_EPAPER_BUSY 3
 #endif
-#ifndef GC_EPAPER_RST
-  #define GC_EPAPER_RST  46
+#ifndef RACELINK_EPAPER_RST
+  #define RACELINK_EPAPER_RST  46
 #endif
-#ifndef GC_EPAPER_DC
-  #define GC_EPAPER_DC   9
+#ifndef RACELINK_EPAPER_DC
+  #define RACELINK_EPAPER_DC   9
 #endif
 
 // Configurable SPI pins (MISO is typically not used by ePaper modules)
-#ifndef GC_EPAPER_MOSI
-  #define GC_EPAPER_MOSI 11
+#ifndef RACELINK_EPAPER_MOSI
+  #define RACELINK_EPAPER_MOSI 11
 #endif
-#ifndef GC_EPAPER_SCK
-  #define GC_EPAPER_SCK  12
+#ifndef RACELINK_EPAPER_SCK
+  #define RACELINK_EPAPER_SCK  12
 #endif
-#ifndef GC_EPAPER_MISO
-  #define GC_EPAPER_MISO -1
+#ifndef RACELINK_EPAPER_MISO
+  #define RACELINK_EPAPER_MISO -1
 #endif
 
 // -----------------------------
 // Deferred refresh behavior
 // -----------------------------
-#ifndef GC_EPAPER_MIN_DEFER_MS
-  #define GC_EPAPER_MIN_DEFER_MS 1500 // Defer refresh for at least this time to allow multiple updates to come in and be coalesced into a single refresh. Adjust based on your expected update frequency and latency requirements
+#ifndef RACELINK_EPAPER_MIN_DEFER_MS
+  #define RACELINK_EPAPER_MIN_DEFER_MS 1500 // Defer refresh for at least this time to allow multiple updates to come in and be coalesced into a single refresh. Adjust based on your expected update frequency and latency requirements
 #endif
 
-#ifndef GC_EPAPER_MAX_DEFER_MS
-  #define GC_EPAPER_MAX_DEFER_MS 4000 // If updates keep coming, still perform a refresh after this max deferral
+#ifndef RACELINK_EPAPER_MAX_DEFER_MS
+  #define RACELINK_EPAPER_MAX_DEFER_MS 4000 // If updates keep coming, still perform a refresh after this max deferral
 #endif
 
-#ifndef GC_EPAPER_MIN_REFRESH_INTERVAL_MS
-  #define GC_EPAPER_MIN_REFRESH_INTERVAL_MS 10000 // Safety: don't full-refresh too frequently.
+#ifndef RACELINK_EPAPER_MIN_REFRESH_INTERVAL_MS
+  #define RACELINK_EPAPER_MIN_REFRESH_INTERVAL_MS 10000 // Safety: don't full-refresh too frequently.
 #endif
 
 // Number of full-screen partial refreshes before a full refresh is enforced.
-#ifndef GC_EPAPER_PARTIAL_REFRESH_LIMIT
-  #define GC_EPAPER_PARTIAL_REFRESH_LIMIT 5
+#ifndef RACELINK_EPAPER_PARTIAL_REFRESH_LIMIT
+  #define RACELINK_EPAPER_PARTIAL_REFRESH_LIMIT 5
 #endif
 
 // Force a full refresh if no full refresh happened within this interval (6 min).
-#ifndef GC_EPAPER_PERIODIC_FULL_REFRESH_MS
-  #define GC_EPAPER_PERIODIC_FULL_REFRESH_MS 360000
+#ifndef RACELINK_EPAPER_PERIODIC_FULL_REFRESH_MS
+  #define RACELINK_EPAPER_PERIODIC_FULL_REFRESH_MS 360000
 #endif
 
 // Optional periodic maintenance refresh (disabled by default).
 // Set to e.g. 600000 (10min) if you notice ghosting over long runtimes.
-#ifndef GC_EPAPER_MAINTENANCE_REFRESH_MS
-  #define GC_EPAPER_MAINTENANCE_REFRESH_MS 0
+#ifndef RACELINK_EPAPER_MAINTENANCE_REFRESH_MS
+  #define RACELINK_EPAPER_MAINTENANCE_REFRESH_MS 0
 #endif
 
 // Hibernate between refreshes (saves power). If you run into wake issues, set to 0.
-#ifndef GC_EPAPER_USE_HIBERNATE
-  #define GC_EPAPER_USE_HIBERNATE 1
+#ifndef RACELINK_EPAPER_USE_HIBERNATE
+  #define RACELINK_EPAPER_USE_HIBERNATE 1
 #endif
 
-// Dedicated SPI bus for ePaper (keep LoRa on default SPI)
+// Dedicated SPI bus for ePaper (keep RaceLink on default SPI)
 #if defined(HSPI)
 static SPIClass epdSPI(HSPI);
 #else
@@ -86,7 +86,7 @@ static SPIClass epdSPI;
 /* 2.9'' EPD Module (B/W), DEPG0290BS 128x296, SSD1680
 GxEPD2_290_BS.h, GxEPD2_290_BS.cpp: no changes */
 // static GxEPD2_BW<GxEPD2_290_BS, GxEPD2_290_BS::HEIGHT> display(
-//   GxEPD2_290_BS(/*CS=*/ GC_EPAPER_CS, /*DC=*/ GC_EPAPER_DC, /*RES=*/ GC_EPAPER_RST, /*BUSY=*/ GC_EPAPER_BUSY)
+//   GxEPD2_290_BS(/*CS=*/ RACELINK_EPAPER_CS, /*DC=*/ RACELINK_EPAPER_DC, /*RES=*/ RACELINK_EPAPER_RST, /*BUSY=*/ RACELINK_EPAPER_BUSY)
 // );
 
 
@@ -98,7 +98,7 @@ GxEPD2_370_GDEY037T03.h:
     static const bool useFastFullUpdate = false; // set false for extended (low) temperature range, 1005000us vs 2950000us
 */
 static GxEPD2_BW<GxEPD2_370_GDEY037T03, GxEPD2_370_GDEY037T03::HEIGHT> display(
- GxEPD2_370_GDEY037T03(/*CS=5*/ GC_EPAPER_CS, /*DC=*/ GC_EPAPER_DC, /*RES=*/ GC_EPAPER_RST, /*BUSY=*/ GC_EPAPER_BUSY)
+ GxEPD2_370_GDEY037T03(/*CS=5*/ RACELINK_EPAPER_CS, /*DC=*/ RACELINK_EPAPER_DC, /*RES=*/ RACELINK_EPAPER_RST, /*BUSY=*/ RACELINK_EPAPER_BUSY)
 );
 
 // -----------------------------
@@ -384,7 +384,7 @@ static void wakeIfNeeded()
 
 static void maybeHibernate()
 {
-#if GC_EPAPER_USE_HIBERNATE
+#if RACELINK_EPAPER_USE_HIBERNATE
   display.hibernate();
   g_hibernated = true;
 #else
@@ -423,7 +423,7 @@ static void performRefresh(bool fullRefresh)
 // -----------------------------
 void epaperInit()
 {
-  epdSPI.begin(GC_EPAPER_SCK, GC_EPAPER_MISO, GC_EPAPER_MOSI, GC_EPAPER_CS);
+  epdSPI.begin(RACELINK_EPAPER_SCK, RACELINK_EPAPER_MISO, RACELINK_EPAPER_MOSI, RACELINK_EPAPER_CS);
   display.epd2.selectSPI(epdSPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));
 
   display.init(115200, false, 50, false); // reset duration was 50
@@ -489,7 +489,7 @@ void service_epaper()
 
   const uint32_t now = millis();
 
-  const bool minOk = (uint32_t)(now - g_lastRefreshMs) >= (uint32_t)GC_EPAPER_MIN_REFRESH_INTERVAL_MS; // checked: good
+  const bool minOk = (uint32_t)(now - g_lastRefreshMs) >= (uint32_t)RACELINK_EPAPER_MIN_REFRESH_INTERVAL_MS; // checked: good
   if (!minOk) return; // enforce minimum interval between refreshes to prevent issues on some panels when refreshing too frequently
 
   if(!g_hasPilotData) return; // no data yet, nothing to do
@@ -498,18 +498,18 @@ void service_epaper()
   if (g_refreshPending)
   {
     // Due to the complexity of ePaper refresh timing and the wide variety of panels out there, we use a simple time-based heuristic to decide when to refresh after receiving updates:
-    // dueByDelay: at least GC_EPAPER_MIN_DEFER_MS has passed since the last received update command
-    // dueByMax: at least GC_EPAPER_MAX_DEFER_MS has passed since the first received update command (prevents starvation if updates keep coming in)
-    // minOk: at least GC_EPAPER_MIN_REFRESH_INTERVAL_MS has passed since the last refresh (full or partial)
-    // periodicFullDue: if GC_EPAPER_PERIODIC_FULL_REFRESH_MS is set, a full refresh is due if at least that time has passed since the last full refresh (enforces periodic full refreshes to reduce ghosting, even if updates are infrequent)
-    // fullRefreshDue: if either periodicFullDue is true or the number of partial refreshes since the last full refresh has reached GC_EPAPER_PARTIAL_REFRESH_LIMIT, a full refresh is due; otherwise, a partial refresh is due
+    // dueByDelay: at least RACELINK_EPAPER_MIN_DEFER_MS has passed since the last received update command
+    // dueByMax: at least RACELINK_EPAPER_MAX_DEFER_MS has passed since the first received update command (prevents starvation if updates keep coming in)
+    // minOk: at least RACELINK_EPAPER_MIN_REFRESH_INTERVAL_MS has passed since the last refresh (full or partial)
+    // periodicFullDue: if RACELINK_EPAPER_PERIODIC_FULL_REFRESH_MS is set, a full refresh is due if at least that time has passed since the last full refresh (enforces periodic full refreshes to reduce ghosting, even if updates are infrequent)
+    // fullRefreshDue: if either periodicFullDue is true or the number of partial refreshes since the last full refresh has reached RACELINK_EPAPER_PARTIAL_REFRESH_LIMIT, a full refresh is due; otherwise, a partial refresh is due
 
-    const bool dueByDelay = (uint32_t)(now - g_lastNewDataMs) >= (uint32_t)GC_EPAPER_MIN_DEFER_MS;
-    const bool dueByMax   = (uint32_t)(now - g_firstNewDataMs) >= (uint32_t)GC_EPAPER_MAX_DEFER_MS;
+    const bool dueByDelay = (uint32_t)(now - g_lastNewDataMs) >= (uint32_t)RACELINK_EPAPER_MIN_DEFER_MS;
+    const bool dueByMax   = (uint32_t)(now - g_firstNewDataMs) >= (uint32_t)RACELINK_EPAPER_MAX_DEFER_MS;
 
-    const bool periodicFullDue = (GC_EPAPER_PERIODIC_FULL_REFRESH_MS > 0) &&
-      ((uint32_t)(now - g_lastFullRefreshMs) >= (uint32_t)GC_EPAPER_PERIODIC_FULL_REFRESH_MS);
-    const bool fullRefreshDue = periodicFullDue || (g_partialRefreshCount >= GC_EPAPER_PARTIAL_REFRESH_LIMIT);
+    const bool periodicFullDue = (RACELINK_EPAPER_PERIODIC_FULL_REFRESH_MS > 0) &&
+      ((uint32_t)(now - g_lastFullRefreshMs) >= (uint32_t)RACELINK_EPAPER_PERIODIC_FULL_REFRESH_MS);
+    const bool fullRefreshDue = periodicFullDue || (g_partialRefreshCount >= RACELINK_EPAPER_PARTIAL_REFRESH_LIMIT);
 
     if (dueByDelay || dueByMax)
     {
@@ -520,16 +520,16 @@ void service_epaper()
   else
   {
     // Optional periodic maintenance refresh to reduce ghosting over very long runtimes
-    if (GC_EPAPER_PERIODIC_FULL_REFRESH_MS > 0)
+    if (RACELINK_EPAPER_PERIODIC_FULL_REFRESH_MS > 0)
     {
-      if ((uint32_t)(now - g_lastFullRefreshMs) >= (uint32_t)GC_EPAPER_PERIODIC_FULL_REFRESH_MS)
+      if ((uint32_t)(now - g_lastFullRefreshMs) >= (uint32_t)RACELINK_EPAPER_PERIODIC_FULL_REFRESH_MS)
       {
         performRefresh(true);
       }
     }
-    else if (GC_EPAPER_MAINTENANCE_REFRESH_MS > 0)
+    else if (RACELINK_EPAPER_MAINTENANCE_REFRESH_MS > 0)
     {
-      if ((uint32_t)(now - g_lastRefreshMs) >= (uint32_t)GC_EPAPER_MAINTENANCE_REFRESH_MS)
+      if ((uint32_t)(now - g_lastRefreshMs) >= (uint32_t)RACELINK_EPAPER_MAINTENANCE_REFRESH_MS)
       {
         performRefresh(true);
       }

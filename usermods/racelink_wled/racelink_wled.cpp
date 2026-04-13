@@ -1,12 +1,12 @@
-#include "gatecontrol_lora_v1.h"
+#include "racelink_wled.h"
 //#include <WiFi.h>  // fallback for WiFi.macAddress()
 
-#ifdef GC_EPAPER
-#include "gc_epaper.h"
+#ifdef RACELINK_EPAPER
+#include "racelink_epaper.h"
 #endif
 
-static LoraLink::Core ll{};
-static LoraLink::Callbacks cb{};
+static RaceLinkTransport::Core rl{};
+static RaceLinkTransport::Callbacks cb{};
 
 // --- Last RX capture (for Info UI) ---
 static uint8_t lastRxRaw[64];
@@ -103,38 +103,39 @@ static inline bool um_read(const um_data_t* d, uint8_t idx, um_types_t expected,
   return true;
 }
 
+// TODO: remove s_gateSelf?
 // ======= Self-pointer for ISR =======
-static UsermodGateControlLoRa* s_gateSelf = nullptr;
+static UsermodRaceLink* s_gateSelf = nullptr;
 
 // ========= ISR (no args, RadioLib-compatible) =========
-/* void IRAM_ATTR UsermodGateControlLoRa::onRxStatic() {
+/* void IRAM_ATTR UsermodRaceLink::onRxStatic() {
   if (s_gateSelf) s_gateSelf->rxFlag = true;
 } */
 
 // ========= Setup =========
-void UsermodGateControlLoRa::setup() {
+void UsermodRaceLink::setup() {
   // init defaults for current gate state
   current.groupId    = 0;
   current.flags      = 0;
   current.presetId   = 11;
   current.brightness = 128;
 // read MAC from efuse (no WiFi init required)
-  // readEfuseMac(); // now in LoraLink::beginCommon()
+  // readEfuseMac(); // now in RaceLinkTransport::beginCommon()
 
-  // init LoRa
+  // init modem
   radioReady = radioInit();
   if (!radioReady) {
-    DEBUG_PRINTLN(F("[GateLoRa] Radio init FAILED"));
+    DEBUG_PRINTLN(F("[RaceLink] Radio init FAILED"));
     return;
   }
 
-  cb.onRxPacket = &UsermodGateControlLoRa::on_rx_node;
-  cb.onTxDone   = &UsermodGateControlLoRa::on_tx_done_node;
+  cb.onRxPacket = &UsermodRaceLink::on_rx_node;
+  cb.onTxDone   = &UsermodRaceLink::on_tx_done_node;
   cb.ctx        = this; // sehr wichtig: für handlePacket
 
-  DEBUG_PRINTLN(F("[GateLoRa] Radio init OK"));
+  DEBUG_PRINTLN(F("[RaceLink] Radio init OK"));
   
-  #ifdef GC_EPAPER
+  #ifdef RACELINK_EPAPER
     epaperInit();
     #if DEV_TYPE == 50
       setDisplayLayout(numberOfSlots);
@@ -143,61 +144,61 @@ void UsermodGateControlLoRa::setup() {
 }
 
 // ========= Loop =========
-void UsermodGateControlLoRa::loop() {
+void UsermodRaceLink::loop() {
   if (!radio) return;
   
   // ersetzt bisheriges Flag-/ISR-/onRx()-Handling
-  LoraLink::service(ll, cb);
+  RaceLinkTransport::service(rl, cb);
 
   if (!batteryUM) {
     // Späterer Retry, bis der Battery-UM seine Daten anbietet
     if (UsermodManager::getUMData(&batteryUM, USERMOD_ID_BATTERY)) {
-      DEBUG_PRINTLN(F("[GateLoRa] Battery UM data acquired"));
+      DEBUG_PRINTLN(F("[RaceLink] Battery UM data acquired"));
     }
   }
-  #ifdef GC_EPAPER
+  #ifdef RACELINK_EPAPER
   service_epaper(); // e-paper display service
   #endif
 }
 
 // ========= Info (UI) =========
-void UsermodGateControlLoRa::addToJsonInfo(JsonObject& root) {
+void UsermodRaceLink::addToJsonInfo(JsonObject& root) {
   // "u" = Objekt; jede Zeile ist ein Array [labelValue1, labelValue2, ...]
   JsonObject user = root["u"];
   if (user.isNull()) user = root.createNestedObject("u");
 
-  // LoRa Init
+  // RaceLink Init
   {
     char initMsg[32];
     snprintf(initMsg, sizeof(initMsg), "%s (code %d)", radioReady ? "OK" : "FAIL", (int)radioInitCode);
-    JsonArray row = user.createNestedArray(F("LoRa Init"));
+    JsonArray row = user.createNestedArray(F("RaceLink Init"));
     row.add(initMsg);
   }
 
   // MyID 3B
   {
     char my3[12];
-    snprintf(my3, sizeof(my3), "%02X:%02X:%02X", ll.myLast3[0], ll.myLast3[1], ll.myLast3[2]);
-    JsonArray row = user.createNestedArray(F("LoRa MyID (3B)"));
+    snprintf(my3, sizeof(my3), "%02X:%02X:%02X", rl.myLast3[0], rl.myLast3[1], rl.myLast3[2]);
+    JsonArray row = user.createNestedArray(F("RaceLink MyID (3B)"));
     row.add(my3);
   }
 
   // RX counters
   {
     JsonArray row = user.createNestedArray(F("RX total"));
-    row.add(String((unsigned long)ll.rxCountTotal));
+    row.add(String((unsigned long)rl.rxCountTotal));
 
     JsonArray row2 = user.createNestedArray(F("RX accepted"));
     row2.add(String((unsigned long)rxAccepted));
 
     JsonArray row3 = user.createNestedArray(F("TX total"));
-    row3.add(String((unsigned long)ll.txCount));
+    row3.add(String((unsigned long)rl.txCount));
   }
 
   // Last RSSI/SNR
   {
     char sig[24];
-    snprintf(sig, sizeof(sig), "%d / %d", (int)ll.lastRssi, (int)ll.lastSnr);
+    snprintf(sig, sizeof(sig), "%d / %d", (int)rl.lastRssi, (int)rl.lastSnr);
     JsonArray row = user.createNestedArray(F("Last RSSI/SNR"));
     row.add(sig);
   }
@@ -208,7 +209,7 @@ void UsermodGateControlLoRa::addToJsonInfo(JsonObject& root) {
       row.add(F("(none)"));
     } else {
       char meta[32];
-      uint32_t age = (millis() - ll.lastRxAtMs) / 1000;
+      uint32_t age = (millis() - rl.lastRxAtMs) / 1000;
       snprintf(meta, sizeof(meta), "%uB (%lus ago)", lastRxLen, (unsigned long)age);
       row.add(meta);
 
@@ -237,8 +238,8 @@ void UsermodGateControlLoRa::addToJsonInfo(JsonObject& root) {
   {
     char debug[16];
     //snprintf(debug, sizeof(debug), "%d", (int)debugCounter);
-    snprintf(debug, sizeof(debug), "%d", (int)ll.debug);
-    //snprintf(debug, sizeof(debug), "%d", (int)ll.toaUsMax17/1000U);
+    snprintf(debug, sizeof(debug), "%d", (int)rl.debug);
+    //snprintf(debug, sizeof(debug), "%d", (int)rl.toaUsMax17/1000U);
     JsonArray row = user.createNestedArray(F("Debug"));
     row.add(debug);
   }
@@ -280,18 +281,18 @@ void UsermodGateControlLoRa::addToJsonInfo(JsonObject& root) {
     fbuf[0] = '\0';
 
     // Power
-    if (current.flags & GC_FLAG_POWER_ON) strlcat(fbuf, "ON", sizeof(fbuf));
+    if (current.flags & RACELINK_FLAG_POWER_ON) strlcat(fbuf, "ON", sizeof(fbuf));
     else                                 strlcat(fbuf, "OFF", sizeof(fbuf));
 
     // Start behaviour / sources
-    if (current.flags & GC_FLAG_ARM_ON_SYNC)   strlcat(fbuf, " ARM", sizeof(fbuf));
+    if (current.flags & RACELINK_FLAG_ARM_ON_SYNC)   strlcat(fbuf, " ARM", sizeof(fbuf));
 
-    if (current.flags & GC_FLAG_HAS_BRI)       strlcat(fbuf, " BriCFG", sizeof(fbuf));
+    if (current.flags & RACELINK_FLAG_HAS_BRI)       strlcat(fbuf, " BriCFG", sizeof(fbuf));
     else                                       strlcat(fbuf, " BriSYNC", sizeof(fbuf));
 
     // Options
-    if (current.flags & GC_FLAG_FORCE_TT0)     strlcat(fbuf, " TT0", sizeof(fbuf));
-    if (current.flags & GC_FLAG_FORCE_REAPPLY) strlcat(fbuf, " RE", sizeof(fbuf));
+    if (current.flags & RACELINK_FLAG_FORCE_TT0)     strlcat(fbuf, " TT0", sizeof(fbuf));
+    if (current.flags & RACELINK_FLAG_FORCE_REAPPLY) strlcat(fbuf, " RE", sizeof(fbuf));
 
     JsonArray row = user.createNestedArray(F("Ctrl Flags"));
     row.add(fbuf);
@@ -342,8 +343,8 @@ void UsermodGateControlLoRa::addToJsonInfo(JsonObject& root) {
 }
 
 // ========= Config =========
-void UsermodGateControlLoRa::addToConfig(JsonObject& root) {
-  JsonObject top = root.createNestedObject("GateLoRa");
+void UsermodRaceLink::addToConfig(JsonObject& root) {
+  JsonObject top = root.createNestedObject("RaceLink");
   top["groupId"] = current.groupId;
   top["macFilterEnabled"] = macFilterEnabled;  // default ON
   top["macFilterPersist"] = macFilterPersist;  // default OFF
@@ -366,17 +367,17 @@ void UsermodGateControlLoRa::addToConfig(JsonObject& root) {
   top["masterFullMac"] = (macFilterPersist && masterFull6Known) ? String(m6) : String("");
 
   // radio defaults
-  JsonObject l = top.createNestedObject("lora");
-  l["freq"] = LORA_FREQ_HZ;
-  l["sf"]   = LORA_SF;
-  l["bw"]   = (int)LORA_BW_KHZ;
-  l["cr"]   = LORA_CR;
-  l["sync"] = LORA_SYNC_WORD;
-  l["txp"]  = LORA_TX_POWER;
+  JsonObject l = top.createNestedObject("RL_RF");
+  l["freq"] = RACELINK_FREQ_HZ;
+  l["sf"]   = RACELINK_SF;
+  l["bw"]   = (int)RACELINK_BW_KHZ;
+  l["cr"]   = RACELINK_CR;
+  l["sync"] = RACELINK_SYNC_WORD;
+  l["txp"]  = RACELINK_TX_POWER;
 }
 
-bool UsermodGateControlLoRa::readFromConfig(JsonObject& root) {
-  JsonObject top = root["GateLoRa"];
+bool UsermodRaceLink::readFromConfig(JsonObject& root) {
+  JsonObject top = root["RaceLink"];
   if (top.isNull()) return false;
 
   // erst Flags lesen
@@ -391,7 +392,7 @@ bool UsermodGateControlLoRa::readFromConfig(JsonObject& root) {
     getJsonValue(top[F("First Slot (1-8)")], first, 1);
     numberOfSlots = constrain(slots, (uint8_t)1, (uint8_t)8);
     firstSlot = constrain(first, (uint8_t)1, (uint8_t)8);
-    #ifdef GC_EPAPER
+    #ifdef RACELINK_EPAPER
       setDisplayLayout(numberOfSlots);
     #endif
   #endif
@@ -420,64 +421,64 @@ bool UsermodGateControlLoRa::readFromConfig(JsonObject& root) {
   return true;
 }
 
-void UsermodGateControlLoRa::onStateChange(uint8_t mode) {
+void UsermodRaceLink::onStateChange(uint8_t mode) {
   // Mirror current runtime state for STATUS replies / UI.
   // IMPORTANT: Do NOT map effectCurrent -> presetId (different concept).
   current.brightness = bri;
 
-  if (bri > 0) current.flags |= GC_FLAG_POWER_ON;
-  else         current.flags &= (uint8_t)~GC_FLAG_POWER_ON;
+  if (bri > 0) current.flags |= RACELINK_FLAG_POWER_ON;
+  else         current.flags &= (uint8_t)~RACELINK_FLAG_POWER_ON;
 
   // currentPreset is the WLED preset index (0 = none)
   current.presetId = currentPreset;
 }
 
 // ========= Radio =========
-bool UsermodGateControlLoRa::radioInit() {
+bool UsermodRaceLink::radioInit() {
   // SPI
-  spi->begin(LORA_PIN_SCK, LORA_PIN_MISO, LORA_PIN_MOSI, LORA_PIN_NSS);
+  spi->begin(RACELINK_PIN_SCK, RACELINK_PIN_MISO, RACELINK_PIN_MOSI, RACELINK_PIN_NSS);
 
   // RadioLib Module(cs, dio1, rst, busy, spi)
-  #if defined(GATE_LORA_SX1262)
-  static SX1262 r(new Module(LORA_PIN_NSS, LORA_PIN_DIO1, LORA_PIN_RST, LORA_PIN_BUSY, *spi));
-  #elif defined(GATE_LORA_LLCC68)
-  static LLCC68 r(new Module(LORA_PIN_NSS, LORA_PIN_DIO1, LORA_PIN_RST, LORA_PIN_BUSY, *spi));
+  #if defined(RACELINK_SX1262)
+  static SX1262 r(new Module(RACELINK_PIN_NSS, RACELINK_PIN_DIO1, RACELINK_PIN_RST, RACELINK_PIN_BUSY, *spi));
+  #elif defined(RACELINK_LLCC68)
+  static LLCC68 r(new Module(RACELINK_PIN_NSS, RACELINK_PIN_DIO1, RACELINK_PIN_RST, RACELINK_PIN_BUSY, *spi));
   #else
-  #error "No LoRa radio module defined"
+  #error "No RaceLink radio module defined"
   #endif
   
   radio = &r;
 
-  LoraLink::PhyCfg phy;
-  phy.freqMHz   = (float)(LORA_FREQ_HZ/1e6f);
-  phy.bwKHz     = LORA_BW_KHZ;
-  phy.sf        = LORA_SF;
-  phy.crDen     = LORA_CR;
-  phy.syncWord  = LORA_SYNC_WORD;
-  phy.preamble  = LORA_PREAMBLE;
+  RaceLinkTransport::PhyCfg phy;
+  phy.freqMHz   = (float)(RACELINK_FREQ_HZ/1e6f);
+  phy.bwKHz     = RACELINK_BW_KHZ;
+  phy.sf        = RACELINK_SF;
+  phy.crDen     = RACELINK_CR;
+  phy.syncWord  = RACELINK_SYNC_WORD;
+  phy.preamble  = RACELINK_PREAMBLE;
   phy.crcOn     = true;
 
   // C3/HT-CT62-spezifisch:
-  phy.txPowerDbm   = LORA_TX_POWER;        // Default überschreiben
+  phy.txPowerDbm   = RACELINK_TX_POWER;        // Default überschreiben
   phy.dio2RfSwitch = 1;                    // SX1262 (HT-CT62) oder auch LLCC68 (DreamLNK)
   phy.rxBoost      = -1;                   // oder 1/0 je nach Boardtests
 
-  radioInitCode = LoraLink::beginCommon(*radio, ll, phy) ? RADIOLIB_ERR_NONE : -999;
+  radioInitCode = RaceLinkTransport::beginCommon(*radio, rl, phy) ? RADIOLIB_ERR_NONE : -999;
   if (radioInitCode != RADIOLIB_ERR_NONE) { radio = nullptr; return false; }
 
-  //ll.radio = radio;
+  //rl.radio = radio;
 
-  ll.lbtEnable = true;   // default: false
+  rl.lbtEnable = true;   // default: false
   
-  LoraLink::attachDio1(*radio, ll);
+  RaceLinkTransport::attachDio1(*radio, rl);
 
-  LoraLink::setDefaultRxContinuous(ll); // *** WICHTIG: Continuous RX über LL aktivieren ***
+  RaceLinkTransport::setDefaultRxContinuous(rl); // *** WICHTIG: Continuous RX über RL aktivieren ***
 
   return true;
 }
 
-bool UsermodGateControlLoRa::senderAllowed(const uint8_t s3[3], uint8_t opcode7) {
-  using namespace LoraProto;
+bool UsermodRaceLink::senderAllowed(const uint8_t s3[3], uint8_t opcode7) {
+  using namespace RaceLinkProto;
   if (!macFilterEnabled) return true;
 
   if (!masterKnown) {
@@ -485,40 +486,40 @@ bool UsermodGateControlLoRa::senderAllowed(const uint8_t s3[3], uint8_t opcode7)
     return (opcode7 == OPC_DEVICES || opcode7 == OPC_SET_GROUP);
   }
   // danach nur noch vom gelernten Master zulassen
-  return LoraLink::same3(s3, masterLast3);
+  return RaceLinkTransport::same3(s3, masterLast3);
 }
 
-void UsermodGateControlLoRa::learnMasterFromSender(const uint8_t s3[3], bool persistIfEnabled) {
+void UsermodRaceLink::learnMasterFromSender(const uint8_t s3[3], bool persistIfEnabled) {
   memcpy(masterLast3, s3, 3);
   masterKnown = true;
   if (persistIfEnabled && macFilterPersist) persistMasterIfNeeded();
 }
 
-void UsermodGateControlLoRa::persistMasterIfNeeded() {
+void UsermodRaceLink::persistMasterIfNeeded() {
   // mark config to be saved (serialized via addToConfig)
   requestJSONBufferLock(10);
   releaseJSONBufferLock();
 }
 
-void UsermodGateControlLoRa::clearMaster() {
+void UsermodRaceLink::clearMaster() {
   masterKnown = false;
   memset(masterLast3, 0, 3);
 }
 
-bool UsermodGateControlLoRa::handleStreamPacket(const uint8_t* buf, uint8_t len, const uint8_t senderLast3[3]) {
-  using namespace LoraProto;
+bool UsermodRaceLink::handleStreamPacket(const uint8_t* buf, uint8_t len, const uint8_t senderLast3[3]) {
+  using namespace RaceLinkProto;
   if (len != (sizeof(Header7) + sizeof(P_Stream))) return false;
 
   P_Stream p{};
   if (!parseBody(buf, len, p)) return false;
 
-  const LoraLink::StreamStatus status = LoraLink::handleStreamPacket(ll, p);
-  if (status != LoraLink::StreamStatus::StreamEnd) return false;
+  const RaceLinkTransport::StreamStatus status = RaceLinkTransport::handleStreamPacket(rl, p);
+  if (status != RaceLinkTransport::StreamStatus::StreamEnd) return false;
 
   sendAckTo(senderLast3, OPC_STREAM, ACK_OK);
 
   uint8_t streamLen = 0;
-  const uint8_t* streamData = LoraLink::streamBuffer(ll, streamLen);
+  const uint8_t* streamData = RaceLinkTransport::streamBuffer(rl, streamLen);
   captureLastStreamPacket(streamData, streamLen);
   StartblockMsgV1 startblock{};
   if (parseStartblockV1(streamData, streamLen, startblock)) {
@@ -530,10 +531,10 @@ bool UsermodGateControlLoRa::handleStreamPacket(const uint8_t* buf, uint8_t len,
 
     char logBuf[160];
     snprintf(logBuf, sizeof(logBuf),
-      "[GateLoRa] STREAM Startblock v1 slot %u chan %s name %s",
+      "[RaceLink] STREAM Startblock v1 slot %u chan %s name %s",
       startblock.slot, startblock.chan, nameBuf);
     DEBUG_PRINTLN(logBuf);
-#ifdef GC_EPAPER
+#ifdef RACELINK_EPAPER
     bool slotValid = true;
     uint8_t displaySlot = startblock.slot;
     #if DEV_TYPE == 50
@@ -550,22 +551,22 @@ bool UsermodGateControlLoRa::handleStreamPacket(const uint8_t* buf, uint8_t len,
     }
 #endif
   } else {
-    DEBUG_PRINTLN(F("[GateLoRa] STREAM Startblock v1 parse failed"));
+    DEBUG_PRINTLN(F("[RaceLink] STREAM Startblock v1 parse failed"));
   }
 
-  LoraLink::clearStreamReady(ll);
+  RaceLinkTransport::clearStreamReady(rl);
   return true;
 }
 
-void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
-  using namespace LoraProto;
+void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
+  using namespace RaceLinkProto;
 
   if (len < sizeof(Header7)) return;
 
   Header7 h{};
   if (!parseHeader(buf, (uint8_t)len, h)) return;
   debugCounter=1;
-  if (!LoraLink::receiverMatches(h.receiver, ll.myLast3)) return;  // broadcast ODER exakt meine 3B
+  if (!RaceLinkTransport::receiverMatches(h.receiver, rl.myLast3)) return;  // broadcast ODER exakt meine 3B
   debugCounter=2;
   if (type_dir(h.type) != DIR_M2N) return;                       // nur Master->Node Requests hier
   debugCounter=3;
@@ -596,7 +597,7 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
       memcpy(targetForReplyLast3, h.sender, 3);
       sendIdentifyReplyTo(targetForReplyLast3, true /* include full MAC */);
       acted = true;
-      DEBUG_PRINTLN(F("[GateLoRa] GET_DEVICES -> schedule IDENTIFY_REPLY"));
+      DEBUG_PRINTLN(F("[RaceLink] GET_DEVICES -> schedule IDENTIFY_REPLY"));
     } break;
 
     case OPC_SET_GROUP: { // SET_GROUP -> apply + ACK
@@ -614,7 +615,7 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
 
       sendAckTo(h.sender, OPC_SET_GROUP, ACK_OK);
       acted = true;
-      DEBUG_PRINTLN(F("[GateLoRa] SET_GROUP -> applied + ACK"));
+      DEBUG_PRINTLN(F("[RaceLink] SET_GROUP -> applied + ACK"));
     } break;
 
     case OPC_CONTROL: { // CONTROL: preset config (arm + optional flags/brightness)
@@ -624,7 +625,7 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
 
       handleControl(p);
       acted = true;
-      DEBUG_PRINTLN(F("[GateLoRa] CONTROL -> configured"));
+      DEBUG_PRINTLN(F("[RaceLink] CONTROL -> configured"));
     } break;
 
     case OPC_SYNC: { // SYNC pulse (global)
@@ -634,14 +635,14 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
       const uint32_t ts24 = ((uint32_t)p.ts24_0) | ((uint32_t)p.ts24_1 << 8) | ((uint32_t)p.ts24_2 << 16);
       handleSync(ts24, p.brightness);
       acted = true;
-      //DEBUG_PRINTLN(F("[GateLoRa] SYNC -> processed"));
+      //DEBUG_PRINTLN(F("[RaceLink] SYNC -> processed"));
     } break;
 
     case OPC_CONFIG: {
-      LoraProto::P_Config p{};
+      RaceLinkProto::P_Config p{};
       if (!parseBody(buf, (uint8_t)len, p)) break;
       //if (!groupMatch(p.groupId)) break;
-      if (LoraLink::isBroadcast3(h.receiver)) return;  // only unicast allowed for config
+      if (RaceLinkTransport::isBroadcast3(h.receiver)) return;  // only unicast allowed for config
 
       sendAckTo(h.sender, OPC_CONFIG, ACK_OK); // ACK first because some options may take time
       acted = true;
@@ -667,7 +668,7 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
         const uint8_t value = constrain(p.data0, (uint8_t)1, (uint8_t)8);
         if (numberOfSlots != value) {
           numberOfSlots = value;
-          #ifdef GC_EPAPER
+          #ifdef RACELINK_EPAPER
             setDisplayLayout(numberOfSlots);
           #endif
           configNeedsWrite = true;
@@ -685,7 +686,7 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
         break;
       }
       
-      //DEBUG_PRINTLN(F("[GateLoRa] CONFIG -> applied"));
+      //DEBUG_PRINTLN(F("[RaceLink] CONFIG -> applied"));
     } break;
 
     case OPC_STATUS: { // GET_STATUS -> STATUS_REPLY
@@ -695,7 +696,7 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
 
       sendStatusReplyTo(h.sender);
       acted = true;
-      DEBUG_PRINTLN(F("[GateLoRa] GET_STATUS -> STATUS_REPLY"));
+      DEBUG_PRINTLN(F("[RaceLink] GET_STATUS -> STATUS_REPLY"));
     } break;
 
     case OPC_STREAM: {
@@ -706,8 +707,8 @@ void UsermodGateControlLoRa::handlePacket(const uint8_t* buf, size_t len) {
   if (acted) rxAccepted++;
 }
 
-void UsermodGateControlLoRa::sendIdentifyReplyTo(const uint8_t destLast3[3], bool includeFullMac) {
-  using namespace LoraProto;
+void UsermodRaceLink::sendIdentifyReplyTo(const uint8_t destLast3[3], bool includeFullMac) {
+  using namespace RaceLinkProto;
   uint8_t out[32];
 
   P_IdentifyReply p{};
@@ -715,43 +716,43 @@ void UsermodGateControlLoRa::sendIdentifyReplyTo(const uint8_t destLast3[3], boo
   p.caps            = DEV_TYPE; // caps in dev_type umbenennen
   p.groupId         = current.groupId;
 
-  if (includeFullMac && ll.macReadOK) {
-    for (int i=0;i<6;i++) p.mac6[i] = ll.myMac6[i];
+  if (includeFullMac && rl.macReadOK) {
+    for (int i=0;i<6;i++) p.mac6[i] = rl.myMac6[i];
   } else {
     // Falls MAC nicht bekannt, sende 0
     for (int i=0;i<6;i++) p.mac6[i] = 0;
   }
 
   uint8_t t = make_type(DIR_N2M, OPC_DEVICES); // IDENTIFY_REPLY
-  uint8_t n = build(out, ll.myLast3, destLast3, t, p);
+  uint8_t n = build(out, rl.myLast3, destLast3, t, p);
   
-  LoraLink::scheduleSend(ll, out, n);
+  RaceLinkTransport::scheduleSend(rl, out, n);
 }
 
-void UsermodGateControlLoRa::sendAckTo(const uint8_t destLast3[3], uint8_t echoOpcode7, LoraProto::AckStatus st) {
-  using namespace LoraProto;
+void UsermodRaceLink::sendAckTo(const uint8_t destLast3[3], uint8_t echoOpcode7, RaceLinkProto::AckStatus st) {
+  using namespace RaceLinkProto;
   uint8_t out[32];
   P_Ack p{ echoOpcode7, (uint8_t)st, 0 /*seq*/ };
   
   uint8_t t = make_type(DIR_N2M, OPC_ACK);
-  uint8_t n = build(out, ll.myLast3, destLast3, t, p);
+  uint8_t n = build(out, rl.myLast3, destLast3, t, p);
   
-  LoraLink::scheduleSend(ll, out, n);
+  RaceLinkTransport::scheduleSend(rl, out, n);
 }
 
-void UsermodGateControlLoRa::sendStatusReplyTo(const uint8_t destLast3[3]) {
-  using namespace LoraProto;
+void UsermodRaceLink::sendStatusReplyTo(const uint8_t destLast3[3]) {
+  using namespace RaceLinkProto;
   uint8_t out[32];
 
   P_StatusReply p{};
   {
     uint8_t fl = current.flags;
-    if (bri > 0) fl |= GC_FLAG_POWER_ON; else fl &= (uint8_t)~GC_FLAG_POWER_ON;
+    if (bri > 0) fl |= RACELINK_FLAG_POWER_ON; else fl &= (uint8_t)~RACELINK_FLAG_POWER_ON;
     p.flags      = fl;
     uint8_t cfg = 0;
-    if (macFilterEnabled) cfg |= GC_CFG_MAC_FILTER_ENABLED;
-    if (macFilterPersist) cfg |= GC_CFG_MAC_FILTER_PERSIST;
-    if (apActive) cfg |= GC_CFG_AP_ACTIVE;
+    if (macFilterEnabled) cfg |= RACELINK_CFG_MAC_FILTER_ENABLED;
+    if (macFilterPersist) cfg |= RACELINK_CFG_MAC_FILTER_PERSIST;
+    if (apActive) cfg |= RACELINK_CFG_AP_ACTIVE;
     p.configByte = cfg;
     p.presetId   = currentPreset;
     p.brightness = bri;
@@ -783,22 +784,22 @@ void UsermodGateControlLoRa::sendStatusReplyTo(const uint8_t destLast3[3]) {
     }
   }
   
-  p.rssi     = (int8_t)ll.lastRssi;
-  p.snr      = (int8_t)ll.lastSnr;
+  p.rssi     = (int8_t)rl.lastRssi;
+  p.snr      = (int8_t)rl.lastSnr;
 
   uint8_t t = make_type(DIR_N2M, OPC_STATUS); // STATUS_REPLY
-  uint8_t n = build(out, ll.myLast3, destLast3, t, p);
+  uint8_t n = build(out, rl.myLast3, destLast3, t, p);
 
-  LoraLink::scheduleSend(ll, out, n);
-  //LoraLink::scheduleSend(ll, out, n, 50, 2500);
+  RaceLinkTransport::scheduleSend(rl, out, n);
+  //RaceLinkTransport::scheduleSend(rl, out, n, 50, 2500);
 }
 
 // ========= Apply CONTROL (legacy immediate) =========
-void UsermodGateControlLoRa::applyControl(const GateCore& in) {
+void UsermodRaceLink::applyControl(const GateCore& in) {
   // Immediate apply (no SYNC). Kept for debug/compat.
   uint8_t desiredBri = 0;
-  if (in.flags & GC_FLAG_POWER_ON) {
-    if (in.flags & GC_FLAG_HAS_BRI) desiredBri = in.brightness;
+  if (in.flags & RACELINK_FLAG_POWER_ON) {
+    if (in.flags & RACELINK_FLAG_HAS_BRI) desiredBri = in.brightness;
     else desiredBri = bri; // keep current if not specified
   }
   bri = desiredBri;
@@ -813,8 +814,8 @@ void UsermodGateControlLoRa::applyControl(const GateCore& in) {
   haveControl = true;
 }
 
-// ========= CONTROL (Preset/Brightness/Flags:ARM, GC_FLAG_FORCE_TT0, etc) handler =========
-void UsermodGateControlLoRa::handleControl(const GateCore& cfg) {
+// ========= CONTROL (Preset/Brightness/Flags:ARM, RACELINK_FLAG_FORCE_TT0, etc) handler =========
+void UsermodRaceLink::handleControl(const GateCore& cfg) {
   pending.presetId = cfg.presetId;
   pending.flags    = cfg.flags;
   pending.bri      = cfg.brightness;
@@ -825,22 +826,22 @@ void UsermodGateControlLoRa::handleControl(const GateCore& cfg) {
   // Mirror latest config (even before the preset is started)
   current.flags    = cfg.flags;
   current.presetId = cfg.presetId;
-  if (cfg.flags & GC_FLAG_HAS_BRI) current.brightness = cfg.brightness;
+  if (cfg.flags & RACELINK_FLAG_HAS_BRI) current.brightness = cfg.brightness;
 
   // Recommended path: arm and start on next SYNC
-  pending.armed = (cfg.flags & GC_FLAG_ARM_ON_SYNC) != 0;
+  pending.armed = (cfg.flags & RACELINK_FLAG_ARM_ON_SYNC) != 0;
 
   if (!pending.armed) {
     // Apply immediately (will still be kept in phase by later SYNC pulses)
     uint16_t prevTT = 0;
-    const bool ttForced = (cfg.flags & GC_FLAG_FORCE_TT0) != 0;
+    const bool ttForced = (cfg.flags & RACELINK_FLAG_FORCE_TT0) != 0;
     if (ttForced) { prevTT = transitionDelay; transitionDelay = 0; }
 
     applyPreset(cfg.presetId, CALL_MODE_NO_NOTIFY);
 
-    if (!(cfg.flags & GC_FLAG_POWER_ON)) {
+    if (!(cfg.flags & RACELINK_FLAG_POWER_ON)) {
       bri = 0;
-    } else if (cfg.flags & GC_FLAG_HAS_BRI) {
+    } else if (cfg.flags & RACELINK_FLAG_HAS_BRI) {
       bri = cfg.brightness;
     }
     stateUpdated(CALL_MODE_NO_NOTIFY);
@@ -850,7 +851,7 @@ void UsermodGateControlLoRa::handleControl(const GateCore& cfg) {
 }
 
 // ========= SYNC handler (global, irregular arrival OK) =========
-void UsermodGateControlLoRa::handleSync(uint32_t ts24, uint8_t briFromPkt) {
+void UsermodRaceLink::handleSync(uint32_t ts24, uint8_t briFromPkt) {
   const uint32_t nowMs = millis();
 
 // ---- unwrap 24-bit master timestamp (ms) to monotonic 32-bit ----
@@ -882,32 +883,32 @@ lastSyncLocalMs = nowMs;
   lastSyncTbErrMs = err; // debug/info
   const uint32_t aerr = (err < 0) ? (uint32_t)(-err) : (uint32_t)err;
 
-  const bool hard = pending.armed || (aerr > (uint32_t)GC_SYNC_HARD_RESYNC_MS);
+  const bool hard = pending.armed || (aerr > (uint32_t)RACELINK_SYNC_HARD_RESYNC_MS);
   if (hard) {
     strip.timebase = desiredTb;
   } else {
     int32_t step = err;
-    if (step > (int32_t)GC_SYNC_MAX_STEP_MS) step = (int32_t)GC_SYNC_MAX_STEP_MS;
-    if (step < -(int32_t)GC_SYNC_MAX_STEP_MS) step = -(int32_t)GC_SYNC_MAX_STEP_MS;
+    if (step > (int32_t)RACELINK_SYNC_MAX_STEP_MS) step = (int32_t)RACELINK_SYNC_MAX_STEP_MS;
+    if (step < -(int32_t)RACELINK_SYNC_MAX_STEP_MS) step = -(int32_t)RACELINK_SYNC_MAX_STEP_MS;
     strip.timebase = (uint32_t)((int32_t)strip.timebase + step);
   }
 
   // ---- start pending preset exactly on first SYNC after CONFIG ----
   if (pending.armed) {
     uint16_t prevTT = 0;
-    const bool ttForced = (pending.flags & GC_FLAG_FORCE_TT0) != 0;
+    const bool ttForced = (pending.flags & RACELINK_FLAG_FORCE_TT0) != 0;
     if (ttForced) { prevTT = transitionDelay; transitionDelay = 0; }
 
-    const bool needApply = ((pending.flags & GC_FLAG_FORCE_REAPPLY) != 0) || (currentPreset != pending.presetId);
+    const bool needApply = ((pending.flags & RACELINK_FLAG_FORCE_REAPPLY) != 0) || (currentPreset != pending.presetId);
     if (needApply) {
       applyPreset(pending.presetId, CALL_MODE_NO_NOTIFY);
     }
 
-    // Brightness: use CONFIG.bri only if GC_FLAG_HAS_BRI is set.
+    // Brightness: use CONFIG.bri only if RACELINK_FLAG_HAS_BRI is set.
     // If CONFIG did NOT include brightness, take it from SYNC packet (live brightness).
-    if (!(pending.flags & GC_FLAG_POWER_ON)) {
+    if (!(pending.flags & RACELINK_FLAG_POWER_ON)) {
       bri = 0;
-    } else if (pending.flags & GC_FLAG_HAS_BRI) {
+    } else if (pending.flags & RACELINK_FLAG_HAS_BRI) {
       bri = pending.bri;
     } else {
       bri = briFromPkt;
@@ -925,8 +926,8 @@ lastSyncLocalMs = nowMs;
   }
 
   // ---- optional live brightness via SYNC (only if last CONFIG had NO brightness) ----
-  if (haveControl && !(current.flags & GC_FLAG_HAS_BRI)) {
-    const uint8_t desiredBri = (current.flags & GC_FLAG_POWER_ON) ? briFromPkt : 0;
+  if (haveControl && !(current.flags & RACELINK_FLAG_HAS_BRI)) {
+    const uint8_t desiredBri = (current.flags & RACELINK_FLAG_POWER_ON) ? briFromPkt : 0;
     if (desiredBri != bri) {
       bri = desiredBri;
       current.brightness = bri;
@@ -937,9 +938,9 @@ lastSyncLocalMs = nowMs;
 
 
 // --- Callback-Brücken als statische Member ---
-void UsermodGateControlLoRa::on_rx_node(const uint8_t* pkt, uint8_t len,
+void UsermodRaceLink::on_rx_node(const uint8_t* pkt, uint8_t len,
                                         int16_t rssi, int8_t snr, void* ctx) {
-  auto* self = static_cast<UsermodGateControlLoRa*>(ctx);
+  auto* self = static_cast<UsermodRaceLink*>(ctx);
   if (!self || !pkt || len == 0) return;
 
 /*   self->lastRssi = rssi;
@@ -950,17 +951,17 @@ void UsermodGateControlLoRa::on_rx_node(const uint8_t* pkt, uint8_t len,
   self->handlePacket(pkt, len);
 }
 
-void UsermodGateControlLoRa::on_tx_done_node(void* ctx) {
-  auto* self = static_cast<UsermodGateControlLoRa*>(ctx);
+void UsermodRaceLink::on_tx_done_node(void* ctx) {
+  auto* self = static_cast<UsermodRaceLink*>(ctx);
   if (!self) return;
   // Optional: Node-spezifische TX-Events
 }
 
 // ========= MAC helpers =========
-/* void UsermodGateControlLoRa::readEfuseMac() {
-  if (LoraLink::readEfuseMac6(myMac6)) {
+/* void UsermodRaceLink::readEfuseMac() {
+  if (RaceLinkTransport::readEfuseMac6(myMac6)) {
     macReadOK = true;
-    LoraLink::last3FromMac6(myLast3, myMac6);
+    RaceLinkTransport::last3FromMac6(myLast3, myMac6);
   } else {
     macReadOK = false;
     memset(myLast3, 0, 3);
@@ -968,5 +969,5 @@ void UsermodGateControlLoRa::on_tx_done_node(void* ctx) {
 } */
 
 // construct & register usermod
-static UsermodGateControlLoRa gatecontrol_lora_v1;
-REGISTER_USERMOD(gatecontrol_lora_v1);
+static UsermodRaceLink racelink_wled;
+REGISTER_USERMOD(racelink_wled);

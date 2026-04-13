@@ -1,10 +1,10 @@
 #pragma once
 
 #include "wled.h"
-#include "lora_link_core.h"
-//#include "lora_proto.h"
+#include "racelink_transport_core.h"
+//#include "racelink_proto.h"
 
-// ===================== LoRa / RadioLib =====================
+// ===================== RaceLink / RadioLib =====================
 //#include <RadioLib.h>
 extern "C" {
   #include "esp_system.h"
@@ -12,15 +12,15 @@ extern "C" {
   #include "esp_mac.h"   // for esp_read_mac / ESP_MAC_WIFI_STA
 }
 
-#define FW_VERSION 2 // Version of the GateControlLoRa firmware
+#define FW_VERSION 2 // Version of the RaceLink WLED Plugin
 
 #ifndef DEV_TYPE
-  #define DEV_TYPE 10 // WLED Device type for GateControlLoRa
+  #define DEV_TYPE 10 // WLED Device type for RaceLink
 #endif
 
-using GateCore = LoraProto::P_Control;  // 4B: groupId, flags, presetId, brightness
+using GateCore = RaceLinkProto::P_Control;  // 4B: groupId, flags, presetId, brightness
 
-// ===================== WLED Sync over LoRa =====================
+// ===================== WLED Sync over RaceLink =====================
 //
 // Preset-based, RX-only nodes:
 // - CONFIG packet: arm preset + optional flags/brightness, but DO NOT start rendering yet.
@@ -33,16 +33,16 @@ using GateCore = LoraProto::P_Control;  // 4B: groupId, flags, presetId, brightn
 // If your protocol header already defines OPC_SYNC, that value will be used.
 
 // Slew limit for timebase correction (ms per received SYNC). Keeps visual jitter <~50ms.
-#ifndef GC_SYNC_MAX_STEP_MS
-  #define GC_SYNC_MAX_STEP_MS 15
+#ifndef RACELINK_SYNC_MAX_STEP_MS
+  #define RACELINK_SYNC_MAX_STEP_MS 15
 #endif
 
 // If phase error exceeds this threshold, snap timebase hard (ms).
-#ifndef GC_SYNC_HARD_RESYNC_MS
-  #define GC_SYNC_HARD_RESYNC_MS 200
+#ifndef RACELINK_SYNC_HARD_RESYNC_MS
+  #define RACELINK_SYNC_HARD_RESYNC_MS 200
 #endif
 
-// Call mode used when applying changes from LoRa (avoid UDP/WiFi notifications)
+// Call mode used when applying changes from RaceLink (avoid UDP/WiFi notifications)
 #ifndef CALL_MODE_NO_NOTIFY
   #define CALL_MODE_NO_NOTIFY CALL_MODE_DIRECT_CHANGE
 #endif
@@ -55,23 +55,23 @@ using GateCore = LoraProto::P_Control;  // 4B: groupId, flags, presetId, brightn
 //
 // Bitfield for CONFIG.flags (stored in P_Control.flags)
 enum GateCfgFlags : uint8_t {
-  GC_FLAG_POWER_ON        = 1u << 0,  // desired power state (1=on). If 0 -> bri forced to 0 on start.
-  GC_FLAG_ARM_ON_SYNC     = 1u << 1,  // if set: do not apply preset until first SYNC arrives
-  GC_FLAG_HAS_BRI         = 1u << 2,  // if set: CONFIG includes explicit brightness; if not set: brightness may come from SYNC (live)
-  GC_FLAG_FORCE_TT0       = 1u << 3,  // if set: force transition delay to 0 when starting the preset
-  GC_FLAG_FORCE_REAPPLY   = 1u << 4,  // if set: re-apply preset even if it's already active
-  GC_FLAG_OFFSET_MODE     = 1u << 5,  // if set: respect the groupDelay and groupQuotient (enable timebase offsets between groups, e.g. for staggered effects)
+  RACELINK_FLAG_POWER_ON        = 1u << 0,  // desired power state (1=on). If 0 -> bri forced to 0 on start.
+  RACELINK_FLAG_ARM_ON_SYNC     = 1u << 1,  // if set: do not apply preset until first SYNC arrives
+  RACELINK_FLAG_HAS_BRI         = 1u << 2,  // if set: CONFIG includes explicit brightness; if not set: brightness may come from SYNC (live)
+  RACELINK_FLAG_FORCE_TT0       = 1u << 3,  // if set: force transition delay to 0 when starting the preset
+  RACELINK_FLAG_FORCE_REAPPLY   = 1u << 4,  // if set: re-apply preset even if it's already active
+  RACELINK_FLAG_OFFSET_MODE     = 1u << 5,  // if set: respect the groupDelay and groupQuotient (enable timebase offsets between groups, e.g. for staggered effects)
 };
 
 // StatusReply config byte flags
 enum GateStatusCfgFlags : uint8_t {
-  GC_CFG_MAC_FILTER_ENABLED  = 1u << 0,
-  GC_CFG_MAC_FILTER_PERSIST  = 1u << 1,
-  GC_CFG_AP_ACTIVE           = 1u << 2,
+  RACELINK_CFG_MAC_FILTER_ENABLED  = 1u << 0,
+  RACELINK_CFG_MAC_FILTER_PERSIST  = 1u << 1,
+  RACELINK_CFG_AP_ACTIVE           = 1u << 2,
 };
 
 // README WLAN Behaviour in WLED
-// wled.h (~Line 380):  WLED_GLOBAL byte apBehavior      _INIT(AP_BEHAVIOR_BUTTON_ONLY); // modified for WLED LoRa Gates
+// wled.h (~Line 380):  WLED_GLOBAL byte apBehavior      _INIT(AP_BEHAVIOR_BUTTON_ONLY); // modified for WLED RaceLink Gates
 // wled.h (~Line 380):  WLED_GLOBAL byte apBehavior      _INIT(AP_BEHAVIOR_BOOT_NO_CONN); // Original for ESP32
 // use AP_BEHAVIOR_TEMPORARY instead of AP_BEHAVIOR_BUTTON_ONLY to start AP on no-WiFi at boot without button?
 // Button Only: Start AP only on button press (5s)
@@ -80,53 +80,53 @@ enum GateStatusCfgFlags : uint8_t {
 
 
 // ------------ HT-CT62 (ESP32-C3 + SX1262) fixed pins ------------
-#ifndef LORA_PIN_MOSI
-  #define LORA_PIN_MOSI   7
+#ifndef RACELINK_PIN_MOSI
+  #define RACELINK_PIN_MOSI   7
 #endif
-#ifndef LORA_PIN_MISO
-  #define LORA_PIN_MISO   6
+#ifndef RACELINK_PIN_MISO
+  #define RACELINK_PIN_MISO   6
 #endif
-#ifndef LORA_PIN_SCK
-  #define LORA_PIN_SCK    10
+#ifndef RACELINK_PIN_SCK
+  #define RACELINK_PIN_SCK    10
 #endif
-#ifndef LORA_PIN_NSS
-  #define LORA_PIN_NSS    8   // strapping pin on HT-CT62 (already wired to CS)
+#ifndef RACELINK_PIN_NSS
+  #define RACELINK_PIN_NSS    8   // strapping pin on HT-CT62 (already wired to CS)
 #endif
-#ifndef LORA_PIN_DIO1
-  #define LORA_PIN_DIO1   3
+#ifndef RACELINK_PIN_DIO1
+  #define RACELINK_PIN_DIO1   3
 #endif
-#ifndef LORA_PIN_BUSY
-  #define LORA_PIN_BUSY   4
+#ifndef RACELINK_PIN_BUSY
+  #define RACELINK_PIN_BUSY   4
 #endif
-#ifndef LORA_PIN_RST
-  #define LORA_PIN_RST    5
-#endif
-
-// ------------ LoRa defaults (EU868) ------------
-#ifndef LORA_FREQ_HZ
-  #define LORA_FREQ_HZ    868000000UL
-#endif
-#ifndef LORA_BW_KHZ
-  #define LORA_BW_KHZ     125.0
-#endif
-#ifndef LORA_SF
-  #define LORA_SF         7
-#endif
-#ifndef LORA_CR
-  #define LORA_CR         5      // 4/5
-#endif
-#ifndef LORA_SYNC_WORD
-  #define LORA_SYNC_WORD  0x12
-#endif
-#ifndef LORA_TX_POWER
-  #define LORA_TX_POWER   14     // dBm
-#endif
-#ifndef LORA_PREAMBLE
-  #define LORA_PREAMBLE   8
+#ifndef RACELINK_PIN_RST
+  #define RACELINK_PIN_RST    5
 #endif
 
+// ------------ RaceLink RaceLink defaults (EU868) ------------
+#ifndef RACELINK_FREQ_HZ
+  #define RACELINK_FREQ_HZ    868000000UL
+#endif
+#ifndef RACELINK_BW_KHZ
+  #define RACELINK_BW_KHZ     125.0
+#endif
+#ifndef RACELINK_SF
+  #define RACELINK_SF         7
+#endif
+#ifndef RACELINK_CR
+  #define RACELINK_CR         5      // 4/5
+#endif
+#ifndef RACELINK_SYNC_WORD
+  #define RACELINK_SYNC_WORD  0x12
+#endif
+#ifndef RACELINK_TX_POWER
+  #define RACELINK_TX_POWER   14     // dBm
+#endif
+#ifndef RACELINK_PREAMBLE
+  #define RACELINK_PREAMBLE   8
+#endif
 
-class UsermodGateControlLoRa : public Usermod {
+
+class UsermodRaceLink : public Usermod {
 public:
   // ----- WLED Usermod API -----
   void setup() override;
@@ -144,12 +144,12 @@ private:
 
   // Radio / SPI
   SPIClass* spi = &SPI;
-  #if defined(GATE_LORA_SX1262)
+  #if defined(RACELINK_SX1262)
     SX1262* radio = nullptr;
-  #elif defined(GATE_LORA_LLCC68)
+  #elif defined(RACELINK_LLCC68)
     LLCC68* radio = nullptr;
   #else
-    #error "No LoRa radio module defined"
+    #error "No RaceLink radio module defined"
   #endif
   
 
@@ -157,7 +157,7 @@ private:
   um_data_t* batteryUM = nullptr;
 
   // Node identity
-  // now in LoraLink::ll struct
+  // now in RaceLink::rl struct
 /*   uint8_t myMac6[6] = {0};
   uint8_t myLast3[3] = {0};
   bool macReadOK = false; */
@@ -170,7 +170,7 @@ private:
     bool    armed = false;       // waiting for SYNC to start
     uint8_t presetId = 0;        // WLED preset ID
     uint8_t flags = 0;           // GateCfgFlags bitfield
-    uint8_t bri = 0;             // desired brightness (if GC_FLAG_HAS_BRI)
+    uint8_t bri = 0;             // desired brightness (if RACELINK_FLAG_HAS_BRI)
     uint32_t rxAtMs = 0;         // when CONFIG was received
   } pending;
 
@@ -202,7 +202,7 @@ private:
   bool    radioReady = false;
   int16_t radioInitCode = 0;
   //uint32_t rxTotal = 0;      // all packets successfully read
-  uint32_t rxAccepted = 0;   // packets that passed filters AND triggered actions (difers from rxTotal and rxCountFiltered in lora_link_core)
+  uint32_t rxAccepted = 0;   // packets that passed filters AND triggered actions (difers from rxTotal and rxCountFiltered in racelink core)
   //int16_t  lastRssi = 0;     // last packet RSSI (approx)
   //int8_t   lastSnr  = 0;     // last SNR (if available)
 
@@ -224,7 +224,7 @@ private:
   static void on_rx_node(const uint8_t* pkt, uint8_t len, int16_t rssi, int8_t snr, void* ctx);
   static void on_tx_done_node(void* ctx);
 
-  void sendAckTo(const uint8_t destLast3[3], uint8_t echoOpcode7, LoraProto::AckStatus st);
+  void sendAckTo(const uint8_t destLast3[3], uint8_t echoOpcode7, RaceLinkProto::AckStatus st);
   void sendIdentifyReplyTo(const uint8_t destLast3[3], bool includeFullMac);
   void sendStatusReplyTo(const uint8_t destLast3[3]);
 
