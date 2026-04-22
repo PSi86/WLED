@@ -234,7 +234,7 @@ static void renderStartScreen()
   {
     display.fillScreen(GxEPD_WHITE);
 
-    drawCenteredText("GateControl Startblock", pickFontFit("GateControl Startblock", W - 8, 30),
+    drawCenteredText("RaceLink Startblock", pickFontFit("RaceLink Startblock", W - 8, 30),
                      0, 0, W, H / 2, GxEPD_BLACK);
 
     drawCenteredText(WLED_RELEASE_NAME, pickFontFit(WLED_RELEASE_NAME, W - 8, (H / 3) - 4),

@@ -2,12 +2,12 @@
 #include <Arduino.h>
 
 /*
-  GateControl ePaper helper (2.9\" BW, GxEPD2)
+  RaceLink ePaper helper (2.9\" BW, GxEPD2)
 
   Public API:
     - void epaperInit();
         Initializes SPI + display and shows a boot screen:
-          "GateControl Startblock" + WLED_RELEASE_NAME
+          "RaceLink Startblock" + WLED_RELEASE_NAME
 
     - void setDisplayLayout(uint8_t numPilots);   // 1..4
         1: single row (nickname large, right full-height inverted bar)
