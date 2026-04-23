@@ -192,6 +192,8 @@ private:
 
   // Discovery reply target
   uint8_t targetForReplyLast3[3] = {0};
+  uint8_t startupIdentifyStage = 0;
+  uint32_t startupIdentifyAtMs[2] = {0, 0};
 
   #if DEV_TYPE == 50
     uint8_t numberOfSlots = 1;
@@ -222,11 +224,11 @@ private:
   //void sendPacket(const uint8_t* data, size_t len);
 
   static void on_rx_node(const uint8_t* pkt, uint8_t len, int16_t rssi, int8_t snr, void* ctx);
-  static void on_tx_done_node(void* ctx);
 
   void sendAckTo(const uint8_t destLast3[3], uint8_t echoOpcode7, RaceLinkProto::AckStatus st);
-  void sendIdentifyReplyTo(const uint8_t destLast3[3], bool includeFullMac);
+  bool sendIdentifyReplyTo(const uint8_t destLast3[3], bool includeFullMac);
   void sendStatusReplyTo(const uint8_t destLast3[3]);
+  void serviceStartupIdentifyReplies();
 
   // Build frames
 

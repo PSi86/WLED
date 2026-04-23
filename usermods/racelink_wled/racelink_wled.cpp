@@ -21,6 +21,8 @@ static char lastStreamHex[(STREAM_INFO_MAX * 3) + 1];
 static uint32_t lastStreamAtMs = 0;
 
 static uint16_t debugCounter = 0;
+static constexpr uint32_t STARTUP_IDENTIFY_FIRST_DELAY_MS = 1000;
+static constexpr uint32_t STARTUP_IDENTIFY_SECOND_DELAY_MS = 10000;
 
 static const char HEXLUT[] = "0123456789ABCDEF";
 
@@ -130,10 +132,14 @@ void UsermodRaceLink::setup() {
   }
 
   cb.onRxPacket = &UsermodRaceLink::on_rx_node;
-  cb.onTxDone   = &UsermodRaceLink::on_tx_done_node;
+  //cb.onTxDone   = &UsermodRaceLink::on_tx_done_node;
   cb.ctx        = this; // sehr wichtig: für handlePacket
 
   DEBUG_PRINTLN(F("[RaceLink] Radio init OK"));
+  const uint32_t nowMs = millis();
+  startupIdentifyStage = 0;
+  startupIdentifyAtMs[0] = nowMs + STARTUP_IDENTIFY_FIRST_DELAY_MS;
+  startupIdentifyAtMs[1] = nowMs + STARTUP_IDENTIFY_SECOND_DELAY_MS;
   
   #ifdef RACELINK_EPAPER
     epaperInit();
@@ -149,6 +155,7 @@ void UsermodRaceLink::loop() {
   
   // ersetzt bisheriges Flag-/ISR-/onRx()-Handling
   RaceLinkTransport::service(rl, cb);
+  serviceStartupIdentifyReplies();
 
   if (!batteryUM) {
     // Späterer Retry, bis der Battery-UM seine Daten anbietet
@@ -707,7 +714,7 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
   if (acted) rxAccepted++;
 }
 
-void UsermodRaceLink::sendIdentifyReplyTo(const uint8_t destLast3[3], bool includeFullMac) {
+bool UsermodRaceLink::sendIdentifyReplyTo(const uint8_t destLast3[3], bool includeFullMac) {
   using namespace RaceLinkProto;
   uint8_t out[32];
 
@@ -726,7 +733,27 @@ void UsermodRaceLink::sendIdentifyReplyTo(const uint8_t destLast3[3], bool inclu
   uint8_t t = make_type(DIR_N2M, OPC_DEVICES); // IDENTIFY_REPLY
   uint8_t n = build(out, rl.myLast3, destLast3, t, p);
   
-  RaceLinkTransport::scheduleSend(rl, out, n);
+  return RaceLinkTransport::scheduleSend(rl, out, n);
+}
+
+void UsermodRaceLink::serviceStartupIdentifyReplies() {
+  if (!radioReady) return;
+  if (startupIdentifyStage >= 2) return;
+  if (current.groupId != 0) {
+    startupIdentifyStage = 2;
+    return;
+  }
+
+  const uint32_t nowMs = millis();
+  if ((int32_t)(nowMs - startupIdentifyAtMs[startupIdentifyStage]) < 0) return;
+
+  static constexpr uint8_t BROADCAST_LAST3[3] = {0xFF, 0xFF, 0xFF};
+  if (!sendIdentifyReplyTo(BROADCAST_LAST3, true)) return;
+
+  startupIdentifyStage++;
+  if (startupIdentifyStage >= 2) {
+    DEBUG_PRINTLN(F("[RaceLink] Startup IDENTIFY_REPLY sequence complete"));
+  }
 }
 
 void UsermodRaceLink::sendAckTo(const uint8_t destLast3[3], uint8_t echoOpcode7, RaceLinkProto::AckStatus st) {
@@ -951,11 +978,11 @@ void UsermodRaceLink::on_rx_node(const uint8_t* pkt, uint8_t len,
   self->handlePacket(pkt, len);
 }
 
-void UsermodRaceLink::on_tx_done_node(void* ctx) {
+/* void UsermodRaceLink::on_tx_done_node(void* ctx) {
   auto* self = static_cast<UsermodRaceLink*>(ctx);
   if (!self) return;
   // Optional: Node-spezifische TX-Events
-}
+} */
 
 // ========= MAC helpers =========
 /* void UsermodRaceLink::readEfuseMac() {
