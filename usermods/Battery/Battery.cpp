@@ -20,8 +20,13 @@ class UsermodBattery : public Usermod
     UMBattery* bat = new UnkownUMBattery();
     batteryConfig cfg;
 
-    int8_t batteryLevel = 0; // current battery level in %
-    float batteryVoltage = 0.0f; // current battery voltage in V
+    // volatile: address is exported via um_data->u_data[]; external readers
+    // (e.g. racelink_wled) dereference these through a void*. The compiler
+    // doesn't see those reads in this TU, so without volatile it elides
+    // writes from refreshExportedBatteryData() — leaving the exported
+    // memory permanently 0 until something happens to spill the register.
+    volatile int8_t batteryLevel = 0; // current battery level in %
+    volatile float  batteryVoltage = 0.0f; // current battery voltage in V
 
 
     // Initial delay before first reading to allow voltage stabilization
@@ -232,10 +237,28 @@ class UsermodBattery : public Usermod
         this->um_data->u_size = 2;
         this->um_data->u_type = new um_types_t[this->um_data->u_size];
         this->um_data->u_data = new void*[this->um_data->u_size];
-        this->um_data->u_data[0] = &batteryVoltage;
+        // C-style cast strips volatile for the void* assignment; consumers
+        // that read these via the exported pointer get the latest committed
+        // value because the writers are forced to memory by volatile.
+        this->um_data->u_data[0] = (void*) &batteryVoltage;
         this->um_data->u_type[0] = UMT_FLOAT;
-        this->um_data->u_data[1] = &batteryLevel;
+        this->um_data->u_data[1] = (void*) &batteryLevel;
         this->um_data->u_type[1] = UMT_BYTE;
+      }
+
+      // Seed exported snapshot so um_data consumers (e.g. racelink_wled)
+      // don't see 0.0f if their first read happens before loop() takes its
+      // first filtered reading. Required because loop() is gated by
+      // strip.isUpdating(), which can block measurements indefinitely on
+      // setups with high-FPS animation; without this seed the exported
+      // snapshot stays 0 until the loop happens to fire. INITIAL_DELAY
+      // still governs the regular filter cycle — only this one boot-time
+      // read is unfiltered.
+      if (batteryPin >= 0) {
+        float seedVoltage = readVoltage();
+        bat->setVoltage(seedVoltage);
+        bat->calculateAndSetLevel(seedVoltage);
+        refreshExportedBatteryData();
       }
 
       // First voltage reading is delayed to allow voltage stabilization after powering up
@@ -312,7 +335,7 @@ class UsermodBattery : public Usermod
         turnOff();
 
 #ifndef WLED_DISABLE_MQTT
-      publishMqtt("battery", String(static_cast<int>(bat->getLevel())).c_str());
+      publishMqtt("battery", String(bat->getLevel()).c_str());
       publishMqtt("voltage", String(bat->getVoltage()).c_str());
 #endif
 

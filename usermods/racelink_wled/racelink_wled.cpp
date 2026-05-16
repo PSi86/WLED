@@ -1,5 +1,6 @@
 #include "racelink_wled.h"
 //#include <WiFi.h>  // fallback for WiFi.macAddress()
+#include "pin_manager.h"
 
 #ifdef RACELINK_EPAPER
 #include "racelink_epaper.h"
@@ -10,7 +11,7 @@ static RaceLinkTransport::Callbacks cb{};
 
 // --- Last RX capture (for Info UI) ---
 static uint8_t lastRxRaw[64];
-static volatile uint8_t lastRxLen = 0;        // volatile: wird in anderem Kontext geschrieben
+static volatile uint8_t lastRxLen = 0;        // volatile: written from a different context
 static char lastRxHex[(64 * 3) + 1];          // "FF " * 64 + '\0'
 //static uint32_t lastRxSeenMs = 0;
 
@@ -58,12 +59,12 @@ static inline void captureLastRxPacket(const uint8_t* buf, size_t len) {
 
   size_t n = (len > sizeof(lastRxRaw)) ? sizeof(lastRxRaw) : len;
 
-  // Rohbytes sichern
+  // store raw bytes
   memcpy(lastRxRaw, buf, n);
   lastRxLen = (uint8_t)n;
   //lastRxSeenMs = millis();
 
-  // Ein-Zeilen-Hexstring bauen
+  // build single-line hex string
   char* p = lastRxHex;
   for (size_t i = 0; i < n; ++i) {
     uint8_t b = lastRxRaw[i];
@@ -71,7 +72,7 @@ static inline void captureLastRxPacket(const uint8_t* buf, size_t len) {
     *p++ = HEXLUT[b & 0x0F];
     *p++ = ' ';
   }
-  if (n) *(p - 1) = '\0';  // letztes Leerzeichen durch 0-terminator ersetzen
+  if (n) *(p - 1) = '\0';  // replace trailing space with NUL terminator
   else   *p = '\0';
 }
 
@@ -116,11 +117,32 @@ static UsermodRaceLink* s_gateSelf = nullptr;
 
 // ========= Setup =========
 void UsermodRaceLink::setup() {
+  // Re-apply fleet-uniformity defaults (FPS, ABL, gamma) before anything else
+  // runs. By now WLED has deserialised cfg.json, so the affected globals carry
+  // whatever the operator's saved config said — possibly drifted from the
+  // fleet's expected values. RaceLink is the authoritative source for these
+  // settings, not per-device cfg.json.
+  applyRaceLinkDefaults();
+
   // init defaults for current gate state
   current.groupId    = 0;
   current.flags      = 0;
   current.presetId   = 11;
   current.brightness = 128;
+
+  // RaceLink: nodes operate in AP+STA mode during firmware updates,
+  // which means WLED's `Network.localIP()` returns the STA address
+  // (not the AP's 4.3.2.1) and the `inSameSubnet` check at
+  // wled_server.cpp:529 rejects AP-side OTA hosts even when they
+  // hold a valid 4.3.2.x DHCP lease. Forcing this off makes /update
+  // use the broader `inLocalSubnet` test which explicitly accepts
+  // 4.3.2.0/24 when apActive. Runs after deserializeConfigFromFS()
+  // so it overrides whatever cfg.json carries — survives factory
+  // resets and persistent operator configs alike. Host-side
+  // OTAService._wled_attempt_unlock is the runtime safety net for
+  // any device flashed before this line was added.
+  // otaSameSubnet = false;
+
 // read MAC from efuse (no WiFi init required)
   // readEfuseMac(); // now in RaceLinkTransport::beginCommon()
 
@@ -133,7 +155,7 @@ void UsermodRaceLink::setup() {
 
   cb.onRxPacket = &UsermodRaceLink::on_rx_node;
   //cb.onTxDone   = &UsermodRaceLink::on_tx_done_node;
-  cb.ctx        = this; // sehr wichtig: für handlePacket
+  cb.ctx        = this; // critical: required by handlePacket
 
   DEBUG_PRINTLN(F("[RaceLink] Radio init OK"));
   const uint32_t nowMs = millis();
@@ -142,23 +164,61 @@ void UsermodRaceLink::setup() {
   startupIdentifyAtMs[1] = nowMs + STARTUP_IDENTIFY_SECOND_DELAY_MS;
   
   #ifdef RACELINK_EPAPER
-    epaperInit();
-    #if DEV_TYPE == 50
-      setDisplayLayout(numberOfSlots);
-    #endif
+    {
+      const PinManagerPinType epdPins[] = {
+        { epdSck,  true  },
+        { epdMosi, true  },
+        { epdMiso, false },
+        { epdCs,   true  },
+        { epdDc,   true  },
+        { epdRst,  true  },
+        { epdBusy, false },
+      };
+      if (PinManager::allocateMultiplePins(epdPins,
+                                           sizeof(epdPins) / sizeof(epdPins[0]),
+                                           PinOwner::UM_Unspecified)) {
+        epaperInit(epdMosi, epdSck, epdMiso, epdCs, epdDc, epdRst, epdBusy);
+        #if DEV_TYPE == 50
+          setDisplayLayout(numberOfSlots);
+        #endif
+      } else {
+        DEBUG_PRINTLN(F("[RaceLink] ePaper PinManager allocation failed — display disabled"));
+      }
+    }
   #endif
+
+  // Boot effect: operator did NOT set a boot preset -> show a random solid
+  // color so it is visible that the device has booted.
+  // When bootPreset != 0, WLED's standard path (beginStrip()/applyPreset)
+  // runs unchanged and our display is suppressed.
+  if (bootPreset == 0) {
+    showBootRandomColor();
+  }
 }
 
 // ========= Loop =========
 void UsermodRaceLink::loop() {
+  // Button: poll the pin directly here so we sample at the full main-loop
+  // rate. Going through WLED's UsermodManager::handleButton() dispatch is
+  // unreliable for fast multi-tap because button.cpp:264 throttles the
+  // dispatcher to one call per ~250 ms while strip.isUpdating(). Our
+  // poll is independent of the radio so triple-tap recovery also works
+  // when radio init failed.
+  const uint32_t nowMs = millis();
+  pollPhysicalButton(nowMs);
+  serviceButtonFade(nowMs);
+
   if (!radio) return;
-  
-  // ersetzt bisheriges Flag-/ISR-/onRx()-Handling
+
+  // replaces the previous flag-/ISR-/onRx() handling
   RaceLinkTransport::service(rl, cb);
   serviceStartupIdentifyReplies();
+  // Offset-mode: fire any deferred apply whose deadline has elapsed.
+  // Cheap when nothing is queued (single bool check).
+  serviceDeferredApply();
 
   if (!batteryUM) {
-    // Späterer Retry, bis der Battery-UM seine Daten anbietet
+    // Retry later until the Battery UM exposes its data
     if (UsermodManager::getUMData(&batteryUM, USERMOD_ID_BATTERY)) {
       DEBUG_PRINTLN(F("[RaceLink] Battery UM data acquired"));
     }
@@ -170,7 +230,7 @@ void UsermodRaceLink::loop() {
 
 // ========= Info (UI) =========
 void UsermodRaceLink::addToJsonInfo(JsonObject& root) {
-  // "u" = Objekt; jede Zeile ist ein Array [labelValue1, labelValue2, ...]
+  // "u" = object; each row is an array [labelValue1, labelValue2, ...]
   JsonObject user = root["u"];
   if (user.isNull()) user = root.createNestedObject("u");
 
@@ -246,7 +306,7 @@ void UsermodRaceLink::addToJsonInfo(JsonObject& root) {
     char debug[16];
     //snprintf(debug, sizeof(debug), "%d", (int)debugCounter);
     snprintf(debug, sizeof(debug), "%d", (int)rl.debug);
-    //snprintf(debug, sizeof(debug), "%d", (int)rl.toaUsMax17/1000U);
+    //snprintf(debug, sizeof(debug), "%d", (int)rl.toaUsMaxPkt/1000U);
     JsonArray row = user.createNestedArray(F("Debug"));
     row.add(debug);
   }
@@ -336,13 +396,12 @@ void UsermodRaceLink::addToJsonInfo(JsonObject& root) {
     row.add(ebuf);
   }
 
-  // Preset info (optional)
+  // Preset / pending CONTROL info
   {
     char pbuf[32];
-    snprintf(pbuf, sizeof(pbuf), "cur=%u pend=%u %s",
+    snprintf(pbuf, sizeof(pbuf), "cur=%u %s",
              (unsigned)current.presetId,
-             (unsigned)pending.presetId,
-             pending.armed ? "ARMED" : "RUN");
+             pending.valid ? "ARMED" : "RUN");
     JsonArray row = user.createNestedArray(F("Preset"));
     row.add(pbuf);
   }
@@ -361,12 +420,12 @@ void UsermodRaceLink::addToConfig(JsonObject& root) {
     top[F("First Slot (1-8)")] = firstSlot;
   #endif
 
-  // masterLast3: nur persistieren, wenn Persistenz aktiv
+  // masterLast3: only persist when persistence is enabled
   char m3[7+1];
   sprintf(m3, "%02X%02X%02X", masterLast3[0], masterLast3[1], masterLast3[2]);
   top["masterLast3"] = (macFilterPersist && masterKnown) ? String(m3) : String("000000");
 
-  // masterFullMac: nur persistieren, wenn Persistenz aktiv
+  // masterFullMac: only persist when persistence is enabled
   char m6[12+1];
   sprintf(m6, "%02X%02X%02X%02X%02X%02X",
           masterFull6[0], masterFull6[1], masterFull6[2],
@@ -381,13 +440,64 @@ void UsermodRaceLink::addToConfig(JsonObject& root) {
   l["cr"]   = RACELINK_CR;
   l["sync"] = RACELINK_SYNC_WORD;
   l["txp"]  = RACELINK_TX_POWER;
+
+  // RaceLink radio control pins. Defaults match the build profile (see
+  // RACELINK_PIN_* macros in racelink_wled.h). Saved values are loaded into
+  // the corresponding pin* members during readFromConfig() and applied when
+  // radioInit() runs at the next boot.
+  JsonObject pins = top.createNestedObject("pins");
+  pins[F("SCK")]  = pinSck;
+  pins[F("MISO")] = pinMiso;
+  pins[F("MOSI")] = pinMosi;
+  pins[F("NSS")]  = pinNss;
+  pins[F("DIO1")] = pinDio1;
+  pins[F("BUSY")] = pinBusy;
+  pins[F("RST")]  = pinRst;
+
+  #ifdef RACELINK_EPAPER
+    JsonObject ep = top.createNestedObject("epaper_pins");
+    ep[F("SCK")]  = epdSck;
+    ep[F("MISO")] = epdMiso;
+    ep[F("MOSI")] = epdMosi;
+    ep[F("CS")]   = epdCs;
+    ep[F("DC")]   = epdDc;
+    ep[F("RST")]  = epdRst;
+    ep[F("BUSY")] = epdBusy;
+  #endif
+
+  // RaceLink-authoritative overrides (settable via OPC_CONFIG 0x05..0x0A or
+  // directly in this WebUI). All six slots are emitted unconditionally so
+  // the operator always sees every override row in WLED Settings → Usermods,
+  // and so OPC_GET_CONFIG can always round-trip. Slot values are pushed to
+  // the live WLED globals by applyRaceLinkDefaults() — readFromConfig()
+  // calls it after every Save so changes are live without a reboot.
+  // Long descriptive keys: WLED's generic Settings → Usermods UI renders
+  // JSON keys 1:1 as field labels, so the keys ARE the labels. Segment
+  // fields are flat with a "Segment N " prefix because WLED does not
+  // render parent-object names as section headers — nesting would just
+  // produce four identical "Start LED"/"Stop LED" rows in the UI.
+  JsonObject ov = top.createNestedObject(F("overrides"));
+  ov[F("Target FPS")]               = overrides.fps;
+  ov[F("ABL Max mA")]               = overrides.ablMaxMa;
+  ov[F("Default Brightness")]       = overrides.briS;
+  ov[F("Transition Duration (ms)")] = overrides.transitionMs;
+  ov[F("Segment 0 Start LED")]      = overrides.seg0Start;
+  ov[F("Segment 0 Stop LED")]       = overrides.seg0Stop;
+  ov[F("Segment 1 Start LED")]      = overrides.seg1Start;
+  ov[F("Segment 1 Stop LED")]       = overrides.seg1Stop;
 }
 
 bool UsermodRaceLink::readFromConfig(JsonObject& root) {
   JsonObject top = root["RaceLink"];
   if (top.isNull()) return false;
 
-  // erst Flags lesen
+  // Snapshot before firstReadFromConfig is cleared further down. Determines
+  // whether we should push the freshly-read overrides into live WLED globals
+  // at the tail of this function (WebUI Save path) or skip it because
+  // setup() will call applyRaceLinkDefaults() in a moment anyway (boot path).
+  const bool wasFirstCall = firstReadFromConfig;
+
+  // read flags first
   getJsonValue(top["groupId"], current.groupId, 0);
   getJsonValue(top["macFilterEnabled"], macFilterEnabled, true);
   getJsonValue(top["macFilterPersist"], macFilterPersist, false);
@@ -404,7 +514,7 @@ bool UsermodRaceLink::readFromConfig(JsonObject& root) {
     #endif
   #endif
 
-  // Master nur aus Config übernehmen, wenn Persistenz aktiv
+  // only adopt master from config when persistence is enabled
   if (macFilterPersist) {
     String s3 = top["masterLast3"] | "000000";
     if (s3.length() == 6) {
@@ -423,33 +533,159 @@ bool UsermodRaceLink::readFromConfig(JsonObject& root) {
       masterFull6Known = true;
     }
   }
-  // Wenn Persistenz aus: Runtime-Werte NICHT überschreiben
+  // When persistence is off: do NOT overwrite runtime values
+
+  // RaceLink radio pins. Capture old values to detect a UI change so we can
+  // request a reboot (SPI re-init at runtime is not supported by design).
+  // On the very first call (boot-time deserialize), suppress the reboot —
+  // the values being read ARE the boot-time values.
+  const int8_t oldSck  = pinSck;
+  const int8_t oldMiso = pinMiso;
+  const int8_t oldMosi = pinMosi;
+  const int8_t oldNss  = pinNss;
+  const int8_t oldDio1 = pinDio1;
+  const int8_t oldBusy = pinBusy;
+  const int8_t oldRst  = pinRst;
+  {
+    JsonObject pins = top["pins"];
+    getJsonValue(pins[F("SCK")],  pinSck,  RACELINK_PIN_SCK);
+    getJsonValue(pins[F("MISO")], pinMiso, RACELINK_PIN_MISO);
+    getJsonValue(pins[F("MOSI")], pinMosi, RACELINK_PIN_MOSI);
+    getJsonValue(pins[F("NSS")],  pinNss,  RACELINK_PIN_NSS);
+    getJsonValue(pins[F("DIO1")], pinDio1, RACELINK_PIN_DIO1);
+    getJsonValue(pins[F("BUSY")], pinBusy, RACELINK_PIN_BUSY);
+    getJsonValue(pins[F("RST")],  pinRst,  RACELINK_PIN_RST);
+  }
+  bool pinsChanged = (oldSck  != pinSck)  || (oldMiso != pinMiso) ||
+                     (oldMosi != pinMosi) || (oldNss  != pinNss)  ||
+                     (oldDio1 != pinDio1) || (oldBusy != pinBusy) ||
+                     (oldRst  != pinRst);
+
+  #ifdef RACELINK_EPAPER
+    const int8_t oldEpdSck  = epdSck;
+    const int8_t oldEpdMiso = epdMiso;
+    const int8_t oldEpdMosi = epdMosi;
+    const int8_t oldEpdCs   = epdCs;
+    const int8_t oldEpdDc   = epdDc;
+    const int8_t oldEpdRst  = epdRst;
+    const int8_t oldEpdBusy = epdBusy;
+    {
+      JsonObject ep = top["epaper_pins"];
+      getJsonValue(ep[F("SCK")],  epdSck,  RACELINK_EPAPER_SCK);
+      getJsonValue(ep[F("MISO")], epdMiso, RACELINK_EPAPER_MISO);
+      getJsonValue(ep[F("MOSI")], epdMosi, RACELINK_EPAPER_MOSI);
+      getJsonValue(ep[F("CS")],   epdCs,   RACELINK_EPAPER_CS);
+      getJsonValue(ep[F("DC")],   epdDc,   RACELINK_EPAPER_DC);
+      getJsonValue(ep[F("RST")],  epdRst,  RACELINK_EPAPER_RST);
+      getJsonValue(ep[F("BUSY")], epdBusy, RACELINK_EPAPER_BUSY);
+    }
+    pinsChanged = pinsChanged ||
+                  (oldEpdSck  != epdSck)  || (oldEpdMiso != epdMiso) ||
+                  (oldEpdMosi != epdMosi) || (oldEpdCs   != epdCs)   ||
+                  (oldEpdDc   != epdDc)   || (oldEpdRst  != epdRst)  ||
+                  (oldEpdBusy != epdBusy);
+  #endif
+
+  if (pinsChanged && !firstReadFromConfig) {
+    DEBUG_PRINTLN(F("[RaceLink] Pin config changed — rebooting to apply"));
+    doReboot = true;
+  }
+  firstReadFromConfig = false;
+
+  // RaceLink-authoritative overrides. Slots are always present in cfg.json
+  // (addToConfig writes them unconditionally); a missing key on first boot
+  // after upgrade falls back to the RACELINK_DEFAULT_* compile constant via
+  // the getJsonValue default arg.
+  JsonObject ov = top["overrides"];
+  getJsonValue(ov[F("Target FPS")],               overrides.fps,          (uint8_t)RACELINK_DEFAULT_FPS);
+  getJsonValue(ov[F("ABL Max mA")],               overrides.ablMaxMa,     (uint16_t)RACELINK_DEFAULT_ABL_MAX_MA);
+  getJsonValue(ov[F("Default Brightness")],       overrides.briS,         (uint8_t)RACELINK_DEFAULT_BRIS);
+  getJsonValue(ov[F("Transition Duration (ms)")], overrides.transitionMs, (uint16_t)RACELINK_DEFAULT_TRANSITION_MS);
+  getJsonValue(ov[F("Segment 0 Start LED")], overrides.seg0Start, (uint16_t)RACELINK_DEFAULT_SEG0_START);
+  getJsonValue(ov[F("Segment 0 Stop LED")],  overrides.seg0Stop,  (uint16_t)RACELINK_DEFAULT_SEG0_STOP);
+  getJsonValue(ov[F("Segment 1 Start LED")], overrides.seg1Start, (uint16_t)RACELINK_DEFAULT_SEG1_START);
+  getJsonValue(ov[F("Segment 1 Stop LED")],  overrides.seg1Stop,  (uint16_t)RACELINK_DEFAULT_SEG1_STOP);
+
+  // WebUI Save path: push the new override values into live WLED globals
+  // immediately so a Save is observable without a reboot. Boot path skips
+  // this — setup() runs applyRaceLinkDefaults() right after WLED's deserialise
+  // anyway, and calling it here would just be duplicate work.
+  if (!wasFirstCall) {
+    applyRaceLinkDefaults();
+  }
 
   return true;
 }
 
 void UsermodRaceLink::onStateChange(uint8_t mode) {
-  // Mirror current runtime state for STATUS replies / UI.
-  // IMPORTANT: Do NOT map effectCurrent -> presetId (different concept).
+  // Mirror current runtime state for STATUS replies / UI. Picks up changes
+  // from the WLED web UI, JSON API, presets being loaded externally, etc.
   current.brightness = bri;
 
   if (bri > 0) current.flags |= RACELINK_FLAG_POWER_ON;
   else         current.flags &= (uint8_t)~RACELINK_FLAG_POWER_ON;
 
-  // currentPreset is the WLED preset index (0 = none)
+  // currentPreset is the WLED preset index (0 = none).
+  // Do NOT map effectCurrent -> presetId (different concept).
   current.presetId = currentPreset;
+
+  refreshFieldsFromSegment();
+}
+
+// Snapshot the WLED main segment into current.fields. Marks every field
+// as known (fieldMask=0xFF, extMask=0x0F) because the segment now has a
+// defined value for every field we expose.
+void UsermodRaceLink::refreshFieldsFromSegment() {
+  Segment& seg = strip.getMainSegment();
+  current.fields.brightness = bri;
+  current.fields.mode       = seg.mode;
+  current.fields.speed      = seg.speed;
+  current.fields.intensity  = seg.intensity;
+  current.fields.custom1    = seg.custom1;
+  current.fields.custom2    = seg.custom2;
+  current.fields.custom3    = seg.custom3;
+  current.fields.check1     = seg.check1;
+  current.fields.check2     = seg.check2;
+  current.fields.check3     = seg.check3;
+  current.fields.palette    = seg.palette;
+  current.fields.color1     = seg.colors[0];
+  current.fields.color2     = seg.colors[1];
+  current.fields.color3     = seg.colors[2];
+  current.fields.fieldMask  = 0xFF;
+  current.fields.extMask    = 0x0F;
+  current.lastUpdateMs      = millis();
 }
 
 // ========= Radio =========
 bool UsermodRaceLink::radioInit() {
-  // SPI
-  spi->begin(RACELINK_PIN_SCK, RACELINK_PIN_MISO, RACELINK_PIN_MOSI, RACELINK_PIN_NSS);
+  // Allocate radio pins via WLED's PinManager so a misconfigured LED bus on
+  // any of these pins fails loudly here instead of silently breaking SPI.
+  // MISO is allowed to be -1 (some modules omit it). Skip it from the alloc
+  // if so — PinManager rejects negative pins.
+  const PinManagerPinType pinsToAlloc[] = {
+    { pinSck,  true  },
+    { pinMosi, true  },
+    { pinMiso, false },
+    { pinNss,  true  },
+    { pinDio1, false },
+    { pinBusy, false },
+    { pinRst,  true  },
+  };
+  if (!PinManager::allocateMultiplePins(pinsToAlloc,
+                                        sizeof(pinsToAlloc) / sizeof(pinsToAlloc[0]),
+                                        PinOwner::UM_Unspecified)) {
+    DEBUG_PRINTLN(F("[RaceLink] PinManager allocation failed (LED bus conflict?)"));
+    return false;
+  }
+
+  // SPI bus init using the runtime-configured pins.
+  spi->begin(pinSck, pinMiso, pinMosi, pinNss);
 
   // RadioLib Module(cs, dio1, rst, busy, spi)
   #if defined(RACELINK_SX1262)
-  static SX1262 r(new Module(RACELINK_PIN_NSS, RACELINK_PIN_DIO1, RACELINK_PIN_RST, RACELINK_PIN_BUSY, *spi));
+  static SX1262 r(new Module(pinNss, pinDio1, pinRst, pinBusy, *spi));
   #elif defined(RACELINK_LLCC68)
-  static LLCC68 r(new Module(RACELINK_PIN_NSS, RACELINK_PIN_DIO1, RACELINK_PIN_RST, RACELINK_PIN_BUSY, *spi));
+  static LLCC68 r(new Module(pinNss, pinDio1, pinRst, pinBusy, *spi));
   #else
   #error "No RaceLink radio module defined"
   #endif
@@ -465,10 +701,10 @@ bool UsermodRaceLink::radioInit() {
   phy.preamble  = RACELINK_PREAMBLE;
   phy.crcOn     = true;
 
-  // C3/HT-CT62-spezifisch:
-  phy.txPowerDbm   = RACELINK_TX_POWER;        // Default überschreiben
-  phy.dio2RfSwitch = 1;                    // SX1262 (HT-CT62) oder auch LLCC68 (DreamLNK)
-  phy.rxBoost      = -1;                   // oder 1/0 je nach Boardtests
+  // C3 / HT-CT62 specific:
+  phy.txPowerDbm   = RACELINK_TX_POWER;        // override default
+  phy.dio2RfSwitch = 1;                    // SX1262 (HT-CT62) or also LLCC68 (DreamLNK)
+  phy.rxBoost      = -1;                   // or 1/0 depending on board tests
 
   radioInitCode = RaceLinkTransport::beginCommon(*radio, rl, phy) ? RADIOLIB_ERR_NONE : -999;
   if (radioInitCode != RADIOLIB_ERR_NONE) { radio = nullptr; return false; }
@@ -479,7 +715,7 @@ bool UsermodRaceLink::radioInit() {
   
   RaceLinkTransport::attachDio1(*radio, rl);
 
-  RaceLinkTransport::setDefaultRxContinuous(rl); // *** WICHTIG: Continuous RX über RL aktivieren ***
+  RaceLinkTransport::setDefaultRxContinuous(rl); // *** IMPORTANT: enable continuous RX via RL ***
 
   return true;
 }
@@ -489,10 +725,10 @@ bool UsermodRaceLink::senderAllowed(const uint8_t s3[3], uint8_t opcode7) {
   if (!macFilterEnabled) return true;
 
   if (!masterKnown) {
-    // solange kein Master gelernt wurde: nur Discovery/Grouping zulassen
+    // while no master has been learned: only allow Discovery/Grouping
     return (opcode7 == OPC_DEVICES || opcode7 == OPC_SET_GROUP);
   }
-  // danach nur noch vom gelernten Master zulassen
+  // after that only accept from the learned master
   return RaceLinkTransport::same3(s3, masterLast3);
 }
 
@@ -500,6 +736,8 @@ void UsermodRaceLink::learnMasterFromSender(const uint8_t s3[3], bool persistIfE
   memcpy(masterLast3, s3, 3);
   masterKnown = true;
   if (persistIfEnabled && macFilterPersist) persistMasterIfNeeded();
+  // Pair event also counts as master contact -> trigger the quiet gate.
+  noteMasterRx();
 }
 
 void UsermodRaceLink::persistMasterIfNeeded() {
@@ -511,6 +749,338 @@ void UsermodRaceLink::persistMasterIfNeeded() {
 void UsermodRaceLink::clearMaster() {
   masterKnown = false;
   memset(masterLast3, 0, 3);
+}
+
+// ========= RaceLink-authoritative apply =========
+// Push every override slot into the live WLED globals, plus enforce the
+// non-override fleet-uniformity defaults (gamma, apBehavior). Called from:
+//
+//   * setup() — once at boot, after WLED's deserialiseConfig has populated
+//     globals from cfg.json. RaceLink overrides whatever WLED loaded.
+//   * readFromConfig() — after every WebUI Save (and any other re-deserialise),
+//     so override changes are live without a reboot.
+//   * OPC_CONFIG 0x0F — after the override slots have been reset to
+//     RACELINK_DEFAULT_*; this drives the inline "factory reset" apply.
+//
+// Idempotent: each block compares the current global to the desired value
+// and only writes (and logs) on actual divergence. A clean device produces
+// a silent boot log; a drifted one prints exactly which setting was corrected.
+// `configNeedsWrite=true` queues a cfg.json re-save so on-disk state matches
+// what the device is actually rendering.
+void UsermodRaceLink::applyRaceLinkDefaults() {
+  bool changed = false;
+
+  // ---- Target refresh rate ----------------------------------------------
+  if (strip.getTargetFps() != overrides.fps) {
+    DEBUG_PRINTF_P(PSTR("[RaceLink] enforcing FPS %u (was %u)\n"),
+                   (unsigned)overrides.fps, (unsigned)strip.getTargetFps());
+    strip.setTargetFps(overrides.fps);
+    changed = true;
+  }
+
+  // ---- Automatic Brightness Limiter -------------------------------------
+  if (BusManager::ablMilliampsMax() != overrides.ablMaxMa) {
+    DEBUG_PRINTF_P(PSTR("[RaceLink] enforcing ABL %u mA (was %u mA)\n"),
+                   (unsigned)overrides.ablMaxMa, (unsigned)BusManager::ablMilliampsMax());
+    BusManager::setMilliampsMax(overrides.ablMaxMa);
+    changed = true;
+  }
+
+  // ---- Gamma correction (non-override fleet-default) ---------------------
+  // Three globals (col on/off, bri on/off, val) — recompute the gamma table
+  // only if any of them actually changed.
+  const bool  defGCol = RACELINK_DEFAULT_GAMMA_COL;
+  const bool  defGBri = RACELINK_DEFAULT_GAMMA_BRI;
+  const float defGVal = RACELINK_DEFAULT_GAMMA_VAL;
+  if (gammaCorrectCol != defGCol || gammaCorrectBri != defGBri || gammaCorrectVal != defGVal) {
+    DEBUG_PRINTF_P(PSTR("[RaceLink] enforcing Gamma defaults: col=%d bri=%d val=%.2f (was col=%d bri=%d val=%.2f)\n"),
+                   (int)defGCol, (int)defGBri, (double)defGVal,
+                   (int)gammaCorrectCol, (int)gammaCorrectBri, (double)gammaCorrectVal);
+    gammaCorrectCol = defGCol;
+    gammaCorrectBri = defGBri;
+    gammaCorrectVal = defGVal;
+    NeoGammaWLEDMethod::calcGammaTable(gammaCorrectVal);
+    changed = true;
+  }
+
+  // ---- AP open behaviour (non-override fleet-default) -------------------
+  // RaceLink fleets keep the WiFi AP closed by default — operators reach a
+  // node via the triple-tap recovery gesture (which calls initAP(true)
+  // directly, bypassing apBehavior). Without this enforcement, a factory-
+  // reset device falls back to WLED's default AP_BEHAVIOR_BOOT_NO_CONN (0)
+  // and auto-opens its AP on every boot when no STA is configured — chatty
+  // RF, breaks the "node is silent until I want to talk to it" property.
+  if (apBehavior != (uint8_t)RACELINK_DEFAULT_AP_BEHAVIOR) {
+    DEBUG_PRINTF_P(PSTR("[RaceLink] enforcing apBehavior default %u (was %u)\n"),
+                   (unsigned)RACELINK_DEFAULT_AP_BEHAVIOR, (unsigned)apBehavior);
+    apBehavior = RACELINK_DEFAULT_AP_BEHAVIOR;
+    changed = true;
+  }
+
+  // ---- Segment 0 geometry -----------------------------------------------
+  if (strip.getSegmentsNum() >= 1) {
+    Segment& s0 = strip.getSegment(0);
+    if (s0.start != overrides.seg0Start || s0.stop != overrides.seg0Stop) {
+      DEBUG_PRINTF_P(PSTR("[RaceLink] enforcing seg[0] geometry %u..%u (was %u..%u)\n"),
+                     (unsigned)overrides.seg0Start, (unsigned)overrides.seg0Stop,
+                     (unsigned)s0.start, (unsigned)s0.stop);
+      s0.setGeometry(overrides.seg0Start, overrides.seg0Stop);
+      changed = true;
+    }
+  }
+
+  // ---- Segment 1 geometry -----------------------------------------------
+  // Sentinel: start == stop means "seg[1] not configured" — leave whatever
+  // is already there alone (creating an empty seg[1] would just waste a
+  // slot in WLED's segment vector).
+  if (overrides.seg1Start != overrides.seg1Stop) {
+    if (strip.getSegmentsNum() <= 1) {
+      strip.appendSegment(overrides.seg1Start, overrides.seg1Stop);
+      DEBUG_PRINTF_P(PSTR("[RaceLink] appended seg[1] %u..%u\n"),
+                     (unsigned)overrides.seg1Start, (unsigned)overrides.seg1Stop);
+      changed = true;
+    }
+    if (strip.getSegmentsNum() > 1) {
+      Segment& s1 = strip.getSegment(1);
+      if (s1.start != overrides.seg1Start || s1.stop != overrides.seg1Stop) {
+        DEBUG_PRINTF_P(PSTR("[RaceLink] enforcing seg[1] geometry %u..%u (was %u..%u)\n"),
+                       (unsigned)overrides.seg1Start, (unsigned)overrides.seg1Stop,
+                       (unsigned)s1.start, (unsigned)s1.stop);
+        s1.setGeometry(overrides.seg1Start, overrides.seg1Stop);
+        changed = true;
+      }
+    }
+  }
+
+  // ---- Default brightness (briS) ----------------------------------------
+  // Affects the SAVED brightness (boot value, restore target) — the LIVE
+  // brightness `bri` is driven by SYNC/CONTROL packets and is not touched
+  // here. OPC_CONFIG 0x09 explicitly snaps `bri` for a UX-immediate update.
+  if (briS != overrides.briS) {
+    DEBUG_PRINTF_P(PSTR("[RaceLink] enforcing briS %u (was %u)\n"),
+                   (unsigned)overrides.briS, (unsigned)briS);
+    briS = overrides.briS;
+    changed = true;
+  }
+
+  // ---- Transition duration ----------------------------------------------
+  if (transitionDelayDefault != overrides.transitionMs) {
+    DEBUG_PRINTF_P(PSTR("[RaceLink] enforcing transitionDelayDefault %u (was %u)\n"),
+                   (unsigned)overrides.transitionMs, (unsigned)transitionDelayDefault);
+    transitionDelayDefault = overrides.transitionMs;
+    changed = true;
+  }
+
+  // Persist via WLED's canonical deferred-save mechanism: the main loop
+  // calls serializeConfigToFS() in its next iteration when configNeedsWrite
+  // is set. serializeConfig() reads the live runtime globals we just wrote,
+  // so cfg.json ends up reflecting the RaceLink-enforced values. UI / JSON
+  // API will therefore agree with what the device is actually rendering.
+  if (changed) {
+    DEBUG_PRINTLN(F("[RaceLink] cfg.json scheduled for re-save with enforced overrides"));
+    configNeedsWrite = true;
+    stateUpdated(CALL_MODE_NO_NOTIFY);
+  }
+}
+
+// ========= Direct-effect visualisations =========
+
+void UsermodRaceLink::showPairConfirmedEffect() {
+  // White breathe, persistent. Replaces the old applyPreset(11, ...) — no
+  // preset slot is reserved anymore, operator can freely assign all slots.
+  Segment& seg = strip.getMainSegment();
+  seg.setMode(FX_MODE_BREATH);
+  seg.speed     = 128;
+  seg.intensity = 128;
+  seg.setColor(0, RGBW32(255, 255, 255, 0));   // white foreground
+  seg.setColor(1, 0);                           // black background
+  bri = 128;
+  stateChanged = true;
+  stateUpdated(CALL_MODE_DIRECT_CHANGE);
+}
+
+void UsermodRaceLink::showBootRandomColor() {
+  // Solid with a random color from {R, G, B}. Only kicks in if the operator
+  // did NOT set a boot preset (bootPreset == 0). Serves as a visual
+  // "device has booted" signal.
+  // esp_random() is the ESP32's hardware RNG (no seed needed).
+  if (bri == 0) bri = briS ? briS : 128;
+  uint8_t pick = (uint8_t)(esp_random() % 3);
+  applyCycleColor(pick);
+  // Seed the ring-buffer cycle: boot already shows one primary color (count=1),
+  // the next click jumps to (pick+1) % 3. That guarantees all three primary
+  // colors have been cycled through after boot+2 clicks before switching to
+  // random — regardless of which color boot picked.
+  btn.primariesShownCount = 1;
+  btn.nextPrimaryIdx      = (uint8_t)((pick + 1) % 3);
+  // lastColorClickMs stays 0: if the operator does not click for >RESET_MS,
+  // the idle reset kicks in and re-seeds the cycle with a new random start.
+}
+
+// ========= Single-click color cycle =========
+
+void UsermodRaceLink::applyCycleColor(uint8_t idx) {
+  if (idx == 0)      { colPri[0] = 255; colPri[1] = 0;   colPri[2] = 0;   colPri[3] = 0; }
+  else if (idx == 1) { colPri[0] = 0;   colPri[1] = 255; colPri[2] = 0;   colPri[3] = 0; }
+  else if (idx == 2) { colPri[0] = 0;   colPri[1] = 0;   colPri[2] = 255; colPri[3] = 0; }
+  else               { setRandomColor(colPri); colPri[3] = 0; }
+
+  Segment& seg = strip.getMainSegment();
+  seg.setMode(FX_MODE_STATIC);
+  seg.setColor(0, RGBW32(colPri[0], colPri[1], colPri[2], 0));
+
+  stateChanged = true;
+  stateUpdated(CALL_MODE_DIRECT_CHANGE);
+}
+
+void UsermodRaceLink::applyColorCycleStep(uint32_t now) {
+  // Idle reset: after >RESET_MS without a single click, the cycle is re-seeded
+  // with a new random start index from {0,1,2}. count=0 means "no primary
+  // color shown yet in this cycle round" — so the next three clicks deliver
+  // all three primaries before switching back to random. uint32 subtraction
+  // handles millis() wrap correctly via underflow.
+  if ((now - btn.lastColorClickMs) > RACELINK_BTN_COLOR_RESET_MS) {
+    btn.primariesShownCount = 0;
+    btn.nextPrimaryIdx      = (uint8_t)(esp_random() % 3);
+  }
+
+  if (btn.primariesShownCount < 3) {
+    // Ring-buffer step: show nextPrimaryIdx, advance via (idx+1) % 3.
+    applyCycleColor(btn.nextPrimaryIdx);
+    btn.primariesShownCount++;
+    btn.nextPrimaryIdx = (uint8_t)((btn.nextPrimaryIdx + 1) % 3);
+  } else {
+    // All three primary colors shown in this round -> random.
+    applyCycleColor(3);
+  }
+
+  btn.lastColorClickMs = now;
+  stateChanged = true;
+  colorUpdated(CALL_MODE_BUTTON);
+}
+
+// ========= Master-contact gate =========
+
+bool UsermodRaceLink::masterContactedRecently() const {
+  if (!anyMasterRxSinceBoot) return false;
+  return (millis() - lastMasterRxMs) < RACELINK_MASTER_QUIET_MS;
+}
+
+void UsermodRaceLink::noteMasterRx() {
+  lastMasterRxMs = millis();
+  anyMasterRxSinceBoot = true;
+}
+
+// ========= Custom button (GPIO 0) =========
+
+bool UsermodRaceLink::handleButton(uint8_t b) {
+  // Override hook: only intercept Button 0 (GPIO 0) so WLED's default
+  // mapping (toggleOnOff/setRandomColor/AP-on-5s) does NOT fire. The actual
+  // state machine is driven from loop() via pollPhysicalButton() — this hook
+  // exists solely for suppression.
+  if (b != 0) return false;
+  if (b >= buttons.size()) return false;
+  if (buttons[b].pin < 0) return false;
+  if (buttons[b].type != BTN_TYPE_PUSH) return false;
+  return true; // skip default handling in button.cpp:290+
+}
+
+void UsermodRaceLink::pollPhysicalButton(uint32_t now) {
+  if (buttons.empty()) return;
+  if (buttons[0].pin < 0) return;
+  if (buttons[0].type != BTN_TYPE_PUSH) return;
+
+  bool pressed = (digitalRead(buttons[0].pin) == LOW); // active-low (INPUT_PULLUP)
+  handleRaceLinkButton(0, pressed, now);
+}
+
+void UsermodRaceLink::handleRaceLinkButton(uint8_t /*b*/, bool pressed, uint32_t now) {
+  // -- Rising edge --
+  if (pressed && !btn.down) {
+    btn.down = true;
+    btn.pressedAtMs = now;
+    btn.longHandled = false;
+    return;
+  }
+
+  // -- Held: long-press -> start brightness fade --
+  if (pressed && btn.down) {
+    if (!btn.longHandled && (now - btn.pressedAtMs) >= RACELINK_BTN_LONG_MS) {
+      btn.longHandled = true;
+      btn.briDirUp    = !btn.briDirUp;       // toggle direction on every hold
+      btn.lastFadeTickMs = now;
+      btn.pendingShortClicks = 0;             // hold is explicitly not a multi-tap
+    }
+    return;
+  }
+
+  // -- Falling edge --
+  if (!pressed && btn.down) {
+    btn.down = false;
+    uint32_t dur = now - btn.pressedAtMs;
+
+    if (btn.longHandled) {
+      // Hold ended -> the fade ran during the hold via applyFinalBri()
+      // (without notifications). Call stateUpdated() once now so WS/MQTT/UDP
+      // clients see the final bri value.
+      btn.longHandled = false;
+      stateUpdated(CALL_MODE_BUTTON);
+      return;
+    }
+
+    if (dur < 50) return; // Debounce (matches WLED_DEBOUNCE_THRESHOLD)
+
+    // short click -> accumulate into multi-tap window
+    if (btn.pendingShortClicks < 255) btn.pendingShortClicks++;
+    btn.lastShortReleaseMs = now;
+    return;
+  }
+
+  // -- Idle: multi-tap window is evaluated once the pause >= MULTI_WINDOW --
+  if (!pressed && !btn.down && btn.pendingShortClicks > 0) {
+    if ((now - btn.lastShortReleaseMs) >= RACELINK_BTN_MULTI_WINDOW_MS) {
+      uint8_t clicks = btn.pendingShortClicks;
+      btn.pendingShortClicks = 0;
+
+      if (clicks >= 3) {
+        // Hotspot — ALWAYS, independent of the master-quiet-gate (recovery path).
+        WLED::instance().initAP(true);
+        return;
+      }
+      if (clicks == 1 && !masterContactedRecently()) {
+        // Cycle color through R -> G -> B -> random cycle. Idle reset (>10s
+        // since last click) falls back to R.
+        applyColorCycleStep(now);
+      }
+      // clicks == 2 -> intentionally no action (reserved for future use).
+    }
+  }
+}
+
+void UsermodRaceLink::serviceButtonFade(uint32_t now) {
+  if (!btn.down || !btn.longHandled) return;
+  if (masterContactedRecently()) return; // lock out if the master speaks during a hold
+  if ((now - btn.lastFadeTickMs) < RACELINK_BTN_FADE_TICK_MS) return;
+
+  btn.lastFadeTickMs = now;
+
+  // Ping-pong: invert direction at the limits so the fade keeps running
+  // continuously as long as the button is held.
+  int next = (int)bri;
+  if (btn.briDirUp) {
+    next += RACELINK_BTN_BRI_STEP;
+    if (next >= 255) { next = 255; btn.briDirUp = false; }
+  } else {
+    next -= RACELINK_BTN_BRI_STEP;
+    if (next <= 1)   { next = 1;   btn.briDirUp = true; } // not fully off -> avoid offMode
+  }
+  if ((uint8_t)next == bri) return;
+  bri = (uint8_t)next;
+
+  // applyFinalBri() bypasses WLED's brightness transition entirely (briOld=briT=
+  // bri + applyBri + strip.trigger). Without this, the transition keeps running
+  // for transitionDelay ms after release and the fade feels extremely sluggish.
+  applyFinalBri();
 }
 
 bool UsermodRaceLink::handleStreamPacket(const uint8_t* buf, uint8_t len, const uint8_t senderLast3[3]) {
@@ -573,17 +1143,24 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
   Header7 h{};
   if (!parseHeader(buf, (uint8_t)len, h)) return;
   debugCounter=1;
-  if (!RaceLinkTransport::receiverMatches(h.receiver, rl.myLast3)) return;  // broadcast ODER exakt meine 3B
+  if (!RaceLinkTransport::receiverMatches(h.receiver, rl.myLast3)) return;  // broadcast OR exactly my 3B
   debugCounter=2;
-  if (type_dir(h.type) != DIR_M2N) return;                       // nur Master->Node Requests hier
+  if (type_dir(h.type) != DIR_M2N) return;                       // only Master->Node requests here
   debugCounter=3;
   const uint8_t opcode7 = type_base(h.type);
 
-  // MAC-Filter (optional wie bisher)
+  // MAC filter (optional, as before)
   if (!senderAllowed(h.sender, opcode7)) return;
   debugCounter=4;
 
-  // Gruppenlogik: für alle Requests, die groupId tragen
+  // Master quiet gate: every accepted packet from the already-paired master
+  // resets the session timer. Pairing events (OPC_SET_GROUP from an unknown
+  // sender) are handled separately in learnMasterFromSender.
+  if (masterKnown && RaceLinkTransport::same3(h.sender, masterLast3)) {
+    noteMasterRx();
+  }
+
+  // Group logic: applies to every request that carries a groupId
   auto groupMatch = [&](uint8_t inGroup) {
     return (inGroup == current.groupId || inGroup == 255);
   };
@@ -611,38 +1188,86 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
       P_SetGroup p{};
       if (!parseBody(buf, (uint8_t)len, p)) break;
 
-      // wie bisher: group 0 erlaubt Setzen / oder "255" Sonderlogiken…
+      // as before: group 0 allows setting / or "255" special-case logic...
       current.groupId = p.groupId;
 
       learnMasterFromSender(h.sender, /*persistIfEnabled*/true);
 
-      // visuelles Feedback
-      bri = 128;
-      applyPreset(11, CALL_MODE_DIRECT_CHANGE);
+      // visual feedback (direct effect call; no preset slot reserved anymore)
+      showPairConfirmedEffect();
 
       sendAckTo(h.sender, OPC_SET_GROUP, ACK_OK);
       acted = true;
       DEBUG_PRINTLN(F("[RaceLink] SET_GROUP -> applied + ACK"));
     } break;
 
-    case OPC_CONTROL: { // CONTROL: preset config (arm + optional flags/brightness)
-      P_Control p{};
+    case OPC_PRESET: { // PRESET: preset config (arm + optional flags/brightness)
+      P_Preset p{};
       if (!parseBody(buf, (uint8_t)len, p)) break;
       if (!groupMatch(p.groupId)) break;
+      // Offset acceptance gate: drop if OFFSET_MODE flag mismatches the
+      // device's *effective* mode (pending if set, else active). PRESET
+      // applies immediately, so on accept we materialise pending here too.
+      if (!offsetGateAccepts(p.flags)) {
+        DEBUG_PRINTLN(F("[RaceLink] PRESET -> dropped by offset gate"));
+        break;
+      }
+      materialisePendingChange();
 
-      handleControl(p);
+      handlePreset(p);
+      acted = true;
+      DEBUG_PRINTLN(F("[RaceLink] PRESET -> configured"));
+    } break;
+
+    case OPC_CONTROL: { // CONTROL: direct effect-parameter remote control (variable-length body)
+      // decide_response() skipped the length check (req_len=0). Enforce bounds here.
+      if (bodyLen < 3 || bodyLen > MAX_P_CONTROL) break;
+      const uint8_t* body = buf + sizeof(Header7);
+      uint8_t grp = 0, fl = 0;
+      AdvancedFields f{};
+      if (!parseControlBody(body, bodyLen, grp, fl, f)) break;
+      if (!groupMatch(grp)) break;
+      // Offset acceptance gate: drop if OFFSET_MODE flag mismatches the
+      // effective mode (see racelink_wled.h, P_Offset comment in
+      // racelink_proto.h). For arm-on-sync packets, materialisation defers
+      // to the SYNC handler so a queued effect inherits the new mode/offset
+      // exactly when it fires; for immediate-apply packets we materialise
+      // now (in handleControl) so the new active_mode applies right away.
+      if (!offsetGateAccepts(fl)) {
+        DEBUG_PRINTLN(F("[RaceLink] CONTROL -> dropped by offset gate"));
+        break;
+      }
+
+      handleControl(fl, f);
       acted = true;
       DEBUG_PRINTLN(F("[RaceLink] CONTROL -> configured"));
     } break;
 
-    case OPC_SYNC: { // SYNC pulse (global)
-      P_Sync p{};
-      if (!parseBody(buf, (uint8_t)len, p)) break;
-
-      const uint32_t ts24 = ((uint32_t)p.ts24_0) | ((uint32_t)p.ts24_1 << 8) | ((uint32_t)p.ts24_2 << 16);
-      handleSync(ts24, p.brightness);
+    case OPC_SYNC: { // SYNC pulse (global, variable 4..5 B body)
+      // RULES has req_len=0 for OPC_SYNC; validate length inline.
+      // 4 B = legacy clock-tick (no flags), 5 B = trailing flags byte.
+      // Bit 0 of flags (SYNC_FLAG_TRIGGER_ARMED) gates pending arm-on-sync
+      // materialisation; without it, only the timebase is adjusted.
+      if (bodyLen < 4 || bodyLen > 5) break;
+      const uint8_t* body = buf + sizeof(Header7);
+      const uint32_t ts24 = ((uint32_t)body[0])
+                          | ((uint32_t)body[1] << 8)
+                          | ((uint32_t)body[2] << 16);
+      const uint8_t brightness = body[3];
+      const uint8_t syncFlags  = (bodyLen >= 5) ? body[4] : 0;
+      handleSync(ts24, brightness, syncFlags);
       acted = true;
       //DEBUG_PRINTLN(F("[RaceLink] SYNC -> processed"));
+    } break;
+
+    case OPC_OFFSET: { // variable-length offset config (2..7 B body)
+      // decide_response() skipped the length check (req_len=0). Bounds and
+      // mode-specific payload sizes are validated inside handleOffset().
+      if (bodyLen < 2 || bodyLen > MAX_P_OFFSET) break;
+      const uint8_t* body = buf + sizeof(Header7);
+      if (!handleOffset(body, bodyLen)) break;
+      acted = true;
+      DEBUG_PRINTLN(F("[RaceLink] OFFSET -> pending update"));
     } break;
 
     case OPC_CONFIG: {
@@ -667,6 +1292,83 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
           WiFi.softAPdisconnect(true);
           apActive = false;
         }
+      } else if (p.option == 0x05) { // Set FPS override
+        overrides.fps = p.data0;
+        strip.setTargetFps(overrides.fps);
+        configNeedsWrite = true;
+        DEBUG_PRINTF_P(PSTR("[RaceLink] OPC_CONFIG: FPS set to %u\n"), (unsigned)overrides.fps);
+      } else if (p.option == 0x06) { // Set Segment 0 geometry
+        overrides.seg0Start = (uint16_t)p.data0 | ((uint16_t)p.data1 << 8);
+        overrides.seg0Stop  = (uint16_t)p.data2 | ((uint16_t)p.data3 << 8);
+        if (strip.getSegmentsNum() >= 1) {
+          strip.getSegment(0).setGeometry(overrides.seg0Start, overrides.seg0Stop);
+        }
+        configNeedsWrite = true;
+        DEBUG_PRINTF_P(PSTR("[RaceLink] OPC_CONFIG: seg[0] geometry set to %u..%u\n"),
+                       (unsigned)overrides.seg0Start, (unsigned)overrides.seg0Stop);
+      } else if (p.option == 0x07) { // Set Segment 1 geometry
+        overrides.seg1Start = (uint16_t)p.data0 | ((uint16_t)p.data1 << 8);
+        overrides.seg1Stop  = (uint16_t)p.data2 | ((uint16_t)p.data3 << 8);
+        // Append seg[1] if missing (no-op if already present or max segments reached)
+        if (strip.getSegmentsNum() <= 1) {
+          strip.appendSegment(overrides.seg1Start, overrides.seg1Stop);
+        }
+        if (strip.getSegmentsNum() > 1) {
+          strip.getSegment(1).setGeometry(overrides.seg1Start, overrides.seg1Stop);
+        }
+        configNeedsWrite = true;
+        DEBUG_PRINTF_P(PSTR("[RaceLink] OPC_CONFIG: seg[1] geometry set to %u..%u\n"),
+                       (unsigned)overrides.seg1Start, (unsigned)overrides.seg1Stop);
+      } else if (p.option == 0x08) { // Set ABL max mA override
+        overrides.ablMaxMa = (uint16_t)p.data0 | ((uint16_t)p.data1 << 8);
+        BusManager::setMilliampsMax(overrides.ablMaxMa);
+        configNeedsWrite = true;
+        DEBUG_PRINTF_P(PSTR("[RaceLink] OPC_CONFIG: ABL set to %u mA\n"), (unsigned)overrides.ablMaxMa);
+      } else if (p.option == 0x09) { // Set default brightness override
+        overrides.briS = p.data0;
+        briS = overrides.briS;
+        // Snap LIVE brightness too so the strip visibly updates without a
+        // reboot — operators editing the row in the host dialog expect
+        // immediate feedback. The live value can still be overridden later
+        // by OPC_CONTROL/OPC_SYNC; this is just the at-save snapshot.
+        bri = overrides.briS;
+        stateUpdated(CALL_MODE_NO_NOTIFY);
+        configNeedsWrite = true;
+        DEBUG_PRINTF_P(PSTR("[RaceLink] OPC_CONFIG: briS set to %u (live bri synced)\n"),
+                       (unsigned)overrides.briS);
+      } else if (p.option == 0x0A) { // Set transition duration override
+        overrides.transitionMs = (uint16_t)p.data0 | ((uint16_t)p.data1 << 8);
+        transitionDelayDefault = overrides.transitionMs;
+        configNeedsWrite = true;
+        DEBUG_PRINTF_P(PSTR("[RaceLink] OPC_CONFIG: transitionDelayDefault set to %u ms\n"),
+                       (unsigned)overrides.transitionMs);
+      } else if (p.option == 0x0F) { // Reset every override slot to RACELINK_DEFAULT_*
+        overrides.fps          = (uint8_t)RACELINK_DEFAULT_FPS;
+        overrides.ablMaxMa     = (uint16_t)RACELINK_DEFAULT_ABL_MAX_MA;
+        overrides.seg0Start    = (uint16_t)RACELINK_DEFAULT_SEG0_START;
+        overrides.seg0Stop     = (uint16_t)RACELINK_DEFAULT_SEG0_STOP;
+        overrides.seg1Start    = (uint16_t)RACELINK_DEFAULT_SEG1_START;
+        overrides.seg1Stop     = (uint16_t)RACELINK_DEFAULT_SEG1_STOP;
+        overrides.briS         = (uint8_t)RACELINK_DEFAULT_BRIS;
+        overrides.transitionMs = (uint16_t)RACELINK_DEFAULT_TRANSITION_MS;
+
+        // resetSegments() rebuilds the segment vector to WLED's default
+        // (one segment spanning the full strip). Unsafe during
+        // strip.service() — guard with suspend/resume. applyRaceLinkDefaults()
+        // below then re-asserts our seg0 sentinel (stop==0 → full strip),
+        // which is a no-op against this fresh state.
+        strip.suspend();
+        strip.resetSegments();
+        strip.resume();
+
+        // Snap LIVE brightness too (same reasoning as 0x09).
+        bri = (uint8_t)RACELINK_DEFAULT_BRIS;
+
+        // applyRaceLinkDefaults() handles FPS/ABL/briS/transition/seg
+        // enforcement + stateUpdated + configNeedsWrite uniformly.
+        applyRaceLinkDefaults();
+
+        DEBUG_PRINTLN(F("[RaceLink] OPC_CONFIG 0x0F: every override reset to RACELINK_DEFAULT_* (no reboot required)"));
       } else if (p.option == 0x81) { // Reboot Node
         if (p.data0 != 0) doReboot = true;
       }
@@ -706,6 +1408,74 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
       DEBUG_PRINTLN(F("[RaceLink] GET_STATUS -> STATUS_REPLY"));
     } break;
 
+    case OPC_GET_CONFIG: { // read-back of an OPC_CONFIG-style option
+      // Body shape: 1 byte (option to read). Reply reuses P_Config (option +
+      // data0..3) so the host's OPC_CONFIG codec can decode it unchanged.
+      // Returns the *live* runtime value — and because applyRaceLinkDefaults()
+      // runs after every OPC_CONFIG / WebUI Save, the live value is always
+      // in sync with the override slot. Host sees "what is the device using
+      // right now", which equals what cfg.json holds.
+      RaceLinkProto::P_GetConfig p{};
+      if (!parseBody(buf, (uint8_t)len, p)) break;
+      if (RaceLinkTransport::isBroadcast3(h.receiver)) return; // unicast-only, like OPC_CONFIG
+
+      uint8_t d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+      bool readable = true;
+      switch (p.option) {
+        case 0x05: { // FPS
+          d0 = strip.getTargetFps();
+        } break;
+        case 0x06: { // Segment 0 geometry
+          uint16_t s = 0, e = 0;
+          if (strip.getSegmentsNum() >= 1) {
+            Segment& seg = strip.getSegment(0);
+            s = seg.start; e = seg.stop;
+          }
+          d0 = (uint8_t)(s & 0xFF); d1 = (uint8_t)(s >> 8);
+          d2 = (uint8_t)(e & 0xFF); d3 = (uint8_t)(e >> 8);
+        } break;
+        case 0x07: { // Segment 1 geometry
+          uint16_t s = 0, e = 0;
+          if (strip.getSegmentsNum() >= 2) {
+            Segment& seg = strip.getSegment(1);
+            s = seg.start; e = seg.stop;
+          }
+          d0 = (uint8_t)(s & 0xFF); d1 = (uint8_t)(s >> 8);
+          d2 = (uint8_t)(e & 0xFF); d3 = (uint8_t)(e >> 8);
+        } break;
+        case 0x08: { // ABL max mA
+          const uint16_t mA = BusManager::ablMilliampsMax();
+          d0 = (uint8_t)(mA & 0xFF); d1 = (uint8_t)(mA >> 8);
+        } break;
+        case 0x09: { // briS
+          d0 = briS;
+        } break;
+        case 0x0A: { // transitionDelayDefault
+          const uint16_t ms = transitionDelayDefault;
+          d0 = (uint8_t)(ms & 0xFF); d1 = (uint8_t)(ms >> 8);
+        } break;
+        #if DEV_TYPE == 50
+        case 0x8C: { // STARTBLOCK: number of slots
+          d0 = numberOfSlots;
+        } break;
+        case 0x8D: { // STARTBLOCK: first slot
+          d0 = firstSlot;
+        } break;
+        #endif
+        default: {
+          // Unknown / write-only option (e.g. 0x02 ClearMaster, 0x0F ClearAll,
+          // 0x81 Reboot). No reply -> host's send_and_wait_for_reply times out
+          // gracefully and the dialog row shows "device: ? [Retry]".
+          readable = false;
+        } break;
+      }
+      if (!readable) break;
+      sendGetConfigReplyTo(h.sender, p.option, d0, d1, d2, d3);
+      acted = true;
+      DEBUG_PRINTF_P(PSTR("[RaceLink] GET_CONFIG opt=0x%02X -> %u %u %u %u\n"),
+                     (unsigned)p.option, (unsigned)d0, (unsigned)d1, (unsigned)d2, (unsigned)d3);
+    } break;
+
     case OPC_STREAM: {
       acted = handleStreamPacket(buf, (uint8_t)len, h.sender);
     } break;
@@ -720,13 +1490,13 @@ bool UsermodRaceLink::sendIdentifyReplyTo(const uint8_t destLast3[3], bool inclu
 
   P_IdentifyReply p{};
   p.fw = PROTO_VER_MAJOR; // fw = protocol version
-  p.caps            = DEV_TYPE; // caps in dev_type umbenennen
+  p.caps            = DEV_TYPE; // rename caps to dev_type
   p.groupId         = current.groupId;
 
   if (includeFullMac && rl.macReadOK) {
     for (int i=0;i<6;i++) p.mac6[i] = rl.myMac6[i];
   } else {
-    // Falls MAC nicht bekannt, sende 0
+    // If MAC unknown, send 0
     for (int i=0;i<6;i++) p.mac6[i] = 0;
   }
 
@@ -781,7 +1551,7 @@ void UsermodRaceLink::sendStatusReplyTo(const uint8_t destLast3[3]) {
     if (macFilterPersist) cfg |= RACELINK_CFG_MAC_FILTER_PERSIST;
     if (apActive) cfg |= RACELINK_CFG_AP_ACTIVE;
     p.configByte = cfg;
-    p.presetId   = currentPreset;
+    p.effectId   = strip.getMainSegment().mode;  // active segment mode (renamed from presetId)
     p.brightness = bri;
   }
   p.vbat_mV  = 0;
@@ -821,64 +1591,445 @@ void UsermodRaceLink::sendStatusReplyTo(const uint8_t destLast3[3]) {
   //RaceLinkTransport::scheduleSend(rl, out, n, 50, 2500);
 }
 
-// ========= Apply CONTROL (legacy immediate) =========
-void UsermodRaceLink::applyControl(const GateCore& in) {
-  // Immediate apply (no SYNC). Kept for debug/compat.
-  uint8_t desiredBri = 0;
-  if (in.flags & RACELINK_FLAG_POWER_ON) {
-    if (in.flags & RACELINK_FLAG_HAS_BRI) desiredBri = in.brightness;
-    else desiredBri = bri; // keep current if not specified
-  }
-  bri = desiredBri;
+void UsermodRaceLink::sendGetConfigReplyTo(const uint8_t destLast3[3], uint8_t option,
+                                           uint8_t data0, uint8_t data1,
+                                           uint8_t data2, uint8_t data3) {
+  // GET_CONFIG_REPLY: same opcode as the request with the N2M direction bit
+  // and a P_Config-shaped body (option + data0..3). Reuses the standard
+  // build() helper so the byte layout matches every other OPC_CONFIG frame
+  // on the wire. Data byte packing per option follows the matching write
+  // command's layout (see OPC_CONFIG dispatcher above).
+  using namespace RaceLinkProto;
+  uint8_t out[32];
 
-  applyPreset(in.presetId, CALL_MODE_NO_NOTIFY);
-  stateUpdated(CALL_MODE_NO_NOTIFY);
+  P_Config p{};
+  p.option = option;
+  p.data0  = data0;
+  p.data1  = data1;
+  p.data2  = data2;
+  p.data3  = data3;
 
-  // Preserve node groupId (CONTROL.groupId is a selector, not a "set group" command)
-  current.flags      = in.flags;
-  current.presetId   = in.presetId;
-  current.brightness = bri;
-  haveControl = true;
+  uint8_t t = make_type(DIR_N2M, OPC_GET_CONFIG);
+  uint8_t n = build(out, rl.myLast3, destLast3, t, p);
+
+  RaceLinkTransport::scheduleSend(rl, out, n);
 }
 
-// ========= CONTROL (Preset/Brightness/Flags:ARM, RACELINK_FLAG_FORCE_TT0, etc) handler =========
-void UsermodRaceLink::handleControl(const GateCore& cfg) {
-  pending.presetId = cfg.presetId;
-  pending.flags    = cfg.flags;
-  pending.bri      = cfg.brightness;
-  pending.rxAtMs   = millis();
-
+// ========= PRESET handler (always immediate) =========
+// Most of p.flags is IGNORED here — control flags are processed only by
+// OPC_CONTROL (single-writer rule). PRESET cannot be armed and cannot drive
+// FORCE_TT0 / FORCE_REAPPLY. A pending CONTROL is intentionally NOT cleared:
+// the queued effect-parameter overrides will overlay on top of the loaded
+// preset on the next SYNC. The OFFSET_MODE flag IS honoured because the
+// gate (in handlePacket) already filtered on it; we use it to propagate the
+// per-device phase offset onto strip.timebase.
+void UsermodRaceLink::handlePreset(const RaceLinkProto::P_Preset& p) {
   haveControl = true;
 
-  // Mirror latest config (even before the preset is started)
-  current.flags    = cfg.flags;
-  current.presetId = cfg.presetId;
-  if (cfg.flags & RACELINK_FLAG_HAS_BRI) current.brightness = cfg.brightness;
+  applyPreset(p.presetId, CALL_MODE_NO_NOTIFY);
+  bri = p.brightness;
 
-  // Recommended path: arm and start on next SYNC
-  pending.armed = (cfg.flags & RACELINK_FLAG_ARM_ON_SYNC) != 0;
+  current.presetId   = p.presetId;
+  current.brightness = p.brightness;
 
-  if (!pending.armed) {
-    // Apply immediately (will still be kept in phase by later SYNC pulses)
-    uint16_t prevTT = 0;
-    const bool ttForced = (cfg.flags & RACELINK_FLAG_FORCE_TT0) != 0;
-    if (ttForced) { prevTT = transitionDelay; transitionDelay = 0; }
+  refreshFieldsFromSegment();
+  stateUpdated(CALL_MODE_NO_NOTIFY);
 
-    applyPreset(cfg.presetId, CALL_MODE_NO_NOTIFY);
+  // Update the per-device phase offset for cyclic effects in the loaded
+  // preset. With OFFSET_MODE flag set, compute against the now-active
+  // config (pendingChange already materialised by the dispatch); without
+  // the flag, reset to 0.
+  const int32_t newOffsetMs = (p.flags & RACELINK_FLAG_OFFSET_MODE)
+                              ? (int32_t)computeOffsetMs(active)
+                              : 0;
+  setActivePhaseOffsetMs(newOffsetMs);
+}
 
-    if (!(cfg.flags & RACELINK_FLAG_POWER_ON)) {
-      bri = 0;
-    } else if (cfg.flags & RACELINK_FLAG_HAS_BRI) {
-      bri = cfg.brightness;
-    }
-    stateUpdated(CALL_MODE_NO_NOTIFY);
+// ========= CONTROL parser =========
+// Variable-length body (3..MAX_P_CONTROL). Layout see P_Control in
+// racelink_proto.h. Returns false if the body is shorter than the fieldMask/
+// extMask imply, or if any trailing bytes remain unconsumed (length mismatch).
+// Pre-rename: parseControlAdvBody.
+bool UsermodRaceLink::parseControlBody(const uint8_t* body, uint8_t len,
+                                       uint8_t& groupId, uint8_t& flags,
+                                       AdvancedFields& out) {
+  using namespace RaceLinkProto;
+  if (!body || len < 3) return false;
 
-    if (ttForced) transitionDelay = prevTT;
+  out = AdvancedFields{};
+  uint8_t p = 0;
+  groupId       = body[p++];
+  flags         = body[p++];
+  const uint8_t fm = body[p++];
+  out.fieldMask = fm;
+
+  auto readU8 = [&](uint8_t& v) -> bool {
+    if (p >= len) return false;
+    v = body[p++];
+    return true;
+  };
+  auto readRGB = [&](uint32_t& c) -> bool {
+    if ((uint16_t)p + 3 > len) return false;
+    const uint8_t r = body[p++];
+    const uint8_t g = body[p++];
+    const uint8_t b = body[p++];
+    c = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b; // W=0
+    return true;
+  };
+
+  if (fm & RL_CTRL_F_BRIGHTNESS) { if (!readU8(out.brightness)) return false; }
+  if (fm & RL_CTRL_F_MODE)       { if (!readU8(out.mode))       return false; }
+  if (fm & RL_CTRL_F_SPEED)      { if (!readU8(out.speed))      return false; }
+  if (fm & RL_CTRL_F_INTENSITY)  { if (!readU8(out.intensity))  return false; }
+  if (fm & RL_CTRL_F_CUSTOM1)    { if (!readU8(out.custom1))    return false; }
+  if (fm & RL_CTRL_F_CUSTOM2)    { if (!readU8(out.custom2))    return false; }
+  if (fm & RL_CTRL_F_CUSTOM3_CHECKS) {
+    uint8_t v = 0;
+    if (!readU8(v)) return false;
+    out.custom3 = (uint8_t)(v & RL_CTRL_C3_MASK);
+    out.check1  = (v & RL_CTRL_CHECK1_BIT) != 0;
+    out.check2  = (v & RL_CTRL_CHECK2_BIT) != 0;
+    out.check3  = (v & RL_CTRL_CHECK3_BIT) != 0;
   }
+  if (fm & RL_CTRL_F_EXT) {
+    uint8_t em = 0;
+    if (!readU8(em)) return false;
+    out.extMask = em;
+    if (em & RL_CTRL_E_PALETTE) { if (!readU8(out.palette)) return false; }
+    if (em & RL_CTRL_E_COLOR1)  { if (!readRGB(out.color1)) return false; }
+    if (em & RL_CTRL_E_COLOR2)  { if (!readRGB(out.color2)) return false; }
+    if (em & RL_CTRL_E_COLOR3)  { if (!readRGB(out.color3)) return false; }
+  }
+
+  // Length must match exactly -- any trailing byte indicates a malformed
+  // packet or an unknown reserved bit the sender expected us to understand.
+  return (p == len);
+}
+
+// ========= CONTROL apply (segment-level field writes) =========
+// Applies only fields whose bit is set in fieldMask/extMask. Power/brightness
+// are driven by the existing RACELINK_FLAG_* semantics, identical to OPC_PRESET.
+void UsermodRaceLink::applyAdvancedFields(uint8_t flags, const AdvancedFields& f) {
+  using namespace RaceLinkProto;
+
+  uint16_t prevTT = 0;
+  const bool ttForced = (flags & RACELINK_FLAG_FORCE_TT0) != 0;
+  if (ttForced) { prevTT = transitionDelay; transitionDelay = 0; }
+
+  Segment& seg = strip.getMainSegment();
+
+  if (f.fieldMask & RL_CTRL_F_MODE)      seg.setMode(f.mode);
+  if (f.fieldMask & RL_CTRL_F_SPEED)     seg.speed      = f.speed;
+  if (f.fieldMask & RL_CTRL_F_INTENSITY) seg.intensity  = f.intensity;
+  if (f.fieldMask & RL_CTRL_F_CUSTOM1)   seg.custom1    = f.custom1;
+  if (f.fieldMask & RL_CTRL_F_CUSTOM2)   seg.custom2    = f.custom2;
+  if (f.fieldMask & RL_CTRL_F_CUSTOM3_CHECKS) {
+    seg.custom3 = f.custom3;
+    seg.check1  = f.check1;
+    seg.check2  = f.check2;
+    seg.check3  = f.check3;
+  }
+  if (f.extMask & RL_CTRL_E_PALETTE) seg.setPalette(f.palette);
+  if (f.extMask & RL_CTRL_E_COLOR1)  seg.setColor(0, f.color1);
+  if (f.extMask & RL_CTRL_E_COLOR2)  seg.setColor(1, f.color2);
+  if (f.extMask & RL_CTRL_E_COLOR3)  seg.setColor(2, f.color3);
+
+  // Power/brightness: identical semantics to OPC_PRESET path.
+  //  - POWER_ON=0     -> bri forced to 0
+  //  - HAS_BRI + BRI  -> explicit brightness from body
+  //  - otherwise      -> bri left untouched (SYNC may drive it later)
+  if (!(flags & RACELINK_FLAG_POWER_ON)) {
+    bri = 0;
+  } else if ((flags & RACELINK_FLAG_HAS_BRI) && (f.fieldMask & RL_CTRL_F_BRIGHTNESS)) {
+    bri = f.brightness;
+  }
+
+  // FORCE_REAPPLY: re-trigger render even if all writes were no-ops.
+  stateUpdated(CALL_MODE_NO_NOTIFY);
+  if (flags & RACELINK_FLAG_FORCE_REAPPLY) {
+    seg.markForReset();
+    stateUpdated(CALL_MODE_NO_NOTIFY);
+  }
+
+  if (ttForced) transitionDelay = prevTT;
+}
+
+// ========= CONTROL handler (single flag writer; arm-on-sync or immediate) =========
+// OPC_CONTROL is the ONLY writer of current.flags. Behaviour is centralized
+// here so flag-driven semantics (ARM, FORCE_*, OFFSET_MODE) are interpreted
+// in exactly one place.
+void UsermodRaceLink::handleControl(uint8_t flags, const AdvancedFields& f) {
+  haveControl = true;
+  current.flags = flags;
+
+  if (flags & RACELINK_FLAG_ARM_ON_SYNC) {
+    pending.fields = f;
+    pending.rxAtMs = millis();
+    // Evaluate the *effective* config (pending if set, else active) against
+    // this device's groupId and snapshot the result. Using the effective
+    // config lets the user send OPC_OFFSET followed immediately by an
+    // arming OPC_CONTROL — the new formula's per-device value is captured
+    // even though pendingChange has not yet materialised (that happens in
+    // handleSync below). A subsequent OPC_OFFSET cannot retroactively
+    // shift this queued effect — its new value is picked up at the next
+    // arm.
+    if (flags & RACELINK_FLAG_OFFSET_MODE) {
+      const OffsetConfig& effCfg = pendingChangeValid ? pendingChange : active;
+      pending.offsetMs = computeOffsetMs(effCfg);
+    } else {
+      pending.offsetMs = 0;
+    }
+    pending.valid  = true;
+    // A new arm cancels any deferred apply still waiting from a previous
+    // SYNC: the operator chose to re-arm before that deadline elapsed.
+    pendingDeferred = false;
+    return;
+  }
+
+  // Immediate-apply path. Also clears any previously-armed CONTROL — sending
+  // a CONTROL with ARM_ON_SYNC=0 is the documented way to cancel a pending
+  // queued effect. Also cancels a deferred apply for the same reason.
+  // The offset acceptance gate already accepted this packet; the dispatch
+  // switch materialised pendingChange before invoking handleControl, so
+  // ``active`` already reflects the new state.
+  applyAdvancedFields(flags, f);
+  mergeFieldsIntoSnapshot(f);
+
+  if ((flags & RACELINK_FLAG_HAS_BRI) && (f.fieldMask & RaceLinkProto::RL_CTRL_F_BRIGHTNESS)) {
+    current.brightness = f.brightness;
+  }
+
+  // Update the per-device phase offset for cyclic effects. With OFFSET_MODE,
+  // compute this device's offset against the now-active config; without it
+  // (offset mode disabled) reset to 0. Keeps strip.timebase consistent with
+  // the new effect's phase semantics immediately.
+  const int32_t newOffsetMs = (flags & RACELINK_FLAG_OFFSET_MODE)
+                              ? (int32_t)computeOffsetMs(active)
+                              : 0;
+  setActivePhaseOffsetMs(newOffsetMs);
+
+  pending.valid = false;
+  pendingDeferred = false;
+}
+
+// ========= OFFSET handler =========
+// Variable-length parser. Body layout (see racelink_proto.h):
+//   Byte 0: groupId   (0..254 = filter; 255 = broadcast all)
+//   Byte 1: mode      (OffsetMode)
+//   Byte 2..: mode-specific payload
+//
+// Filters on groupId so a broadcast (255) is accepted by every device
+// while a specific group only matches its members. Returns false on
+// malformed bodies; caller treats false as drop.
+//
+// A new OPC_OFFSET overwrites any prior pendingChange — the documented
+// way to cancel a not-yet-materialised activation.
+bool UsermodRaceLink::handleOffset(const uint8_t* body, uint8_t bodyLen) {
+  using namespace RaceLinkProto;
+  if (bodyLen < 2) return false;
+  const uint8_t groupId = body[0];
+  if (groupId != 255 && groupId != current.groupId) return false;
+
+  const uint8_t mode = body[1];
+  OffsetConfig cfg{};
+  cfg.mode = mode;
+
+  switch (mode) {
+    case OFFSET_MODE_NONE:
+      if (bodyLen != 2) return false;
+      break;
+    case OFFSET_MODE_EXPLICIT:
+      if (bodyLen != 4) return false;
+      cfg.explicit_ms = (uint16_t)body[2] | ((uint16_t)body[3] << 8);
+      break;
+    case OFFSET_MODE_LINEAR:
+      if (bodyLen != 6) return false;
+      cfg.base_ms = (int16_t)((uint16_t)body[2] | ((uint16_t)body[3] << 8));
+      cfg.step_ms = (int16_t)((uint16_t)body[4] | ((uint16_t)body[5] << 8));
+      break;
+    case OFFSET_MODE_VSHAPE:
+      if (bodyLen != 7) return false;
+      cfg.base_ms = (int16_t)((uint16_t)body[2] | ((uint16_t)body[3] << 8));
+      cfg.step_ms = (int16_t)((uint16_t)body[4] | ((uint16_t)body[5] << 8));
+      cfg.center  = body[6];
+      break;
+    case OFFSET_MODE_MODULO:
+      if (bodyLen != 7) return false;
+      cfg.base_ms = (int16_t)((uint16_t)body[2] | ((uint16_t)body[3] << 8));
+      cfg.step_ms = (int16_t)((uint16_t)body[4] | ((uint16_t)body[5] << 8));
+      cfg.cycle   = body[6] ? body[6] : 1;
+      break;
+    default:
+      return false;  // unknown mode (forward-compat: drop)
+  }
+
+  pendingChange      = cfg;
+  pendingChangeValid = true;
+  return true;
+}
+
+bool UsermodRaceLink::offsetGateAccepts(uint8_t packetFlags) const {
+  // Strict symmetric gate (2026-04-30 correction):
+  //
+  // The packet's OFFSET_MODE flag MUST match the receiver's effective
+  // offset state. Both directions are strict:
+  //
+  //   F=1 + E=1  -> ACCEPT  (use stored offset)
+  //   F=0 + E=0  -> ACCEPT  (normal immediate apply)
+  //   F=1 + E=0  -> DROP    (use-offset request without configured offset)
+  //   F=0 + E=1  -> DROP    (immediate-apply request to an offset-configured
+  //                          device; the device "stays in offset mode" until
+  //                          OPC_OFFSET(NONE) followed by a materialisation
+  //                          event explicitly transitions it out)
+  //
+  // Design rule: state transitions between "in offset mode" and "not in
+  // offset mode" happen ONLY via OPC_OFFSET. CONTROL/PRESET packets just
+  // dispatch effects within the current state; they never transition the
+  // device's offset configuration. This keeps Strategy A (broadcast OPC_CONTROL
+  // with F=1 lands on exactly the configured subset) functional and gives
+  // the operator a single, explicit transition mechanism.
+  //
+  // Effective config = pending if set, else active. To leave offset mode,
+  // the operator sends OPC_OFFSET(NONE) (which sets pending=NONE so
+  // subsequent F=0 packets accept), then sends a F=0 packet that
+  // materialises pending into active (an OPC_PRESET, or an ARM_ON_SYNC
+  // OPC_CONTROL followed by OPC_SYNC). The host-side scene_runner's
+  // ``offset_group(mode=none)`` container performs both steps in one
+  // operator action.
+  const OffsetConfig& eff = pendingChangeValid ? pendingChange : active;
+  const bool effIsActive = (eff.mode != RaceLinkProto::OFFSET_MODE_NONE);
+  const bool packetWantsActive = (packetFlags & RACELINK_FLAG_OFFSET_MODE) != 0;
+  return packetWantsActive == effIsActive;
+}
+
+void UsermodRaceLink::materialisePendingChange() {
+  if (!pendingChangeValid) return;
+  active = pendingChange;
+  pendingChangeValid = false;
+}
+
+// ========= Formula evaluator =========
+// Mirrors ``racelink/domain/offset_formula.py`` on the host. Both must
+// produce byte-identical results for any (config, group_id) triple.
+uint16_t UsermodRaceLink::computeOffsetMs(const OffsetConfig& cfg) const {
+  using namespace RaceLinkProto;
+  const int32_t gid = (int32_t)current.groupId;
+  int32_t v = 0;
+  switch (cfg.mode) {
+    case OFFSET_MODE_NONE:
+      v = 0;
+      break;
+    case OFFSET_MODE_EXPLICIT:
+      v = (int32_t)cfg.explicit_ms;
+      break;
+    case OFFSET_MODE_LINEAR:
+      v = (int32_t)cfg.base_ms + gid * (int32_t)cfg.step_ms;
+      break;
+    case OFFSET_MODE_VSHAPE: {
+      const int32_t d = gid - (int32_t)cfg.center;
+      const int32_t da = (d < 0) ? -d : d;
+      v = (int32_t)cfg.base_ms + da * (int32_t)cfg.step_ms;
+      break;
+    }
+    case OFFSET_MODE_MODULO: {
+      const int32_t cycle = (cfg.cycle > 0) ? cfg.cycle : 1;
+      v = (int32_t)cfg.base_ms + (gid % cycle) * (int32_t)cfg.step_ms;
+      break;
+    }
+    default:
+      v = 0;
+      break;
+  }
+  if (v < 0) v = 0;
+  if (v > 0xFFFF) v = 0xFFFF;
+  return (uint16_t)v;
+}
+
+// ========= Deferred apply tick =========
+// Replays the same apply sequence handleSync() runs inline when offsetMs == 0.
+// Called from loop() each iteration; cheap when no deferred apply is queued.
+void UsermodRaceLink::serviceDeferredApply() {
+  if (!pendingDeferred) return;
+  // Wrap-safe deadline test: signed difference >= 0 means deadline passed.
+  if ((int32_t)(millis() - pendingDeferredAt) < 0) return;
+
+  applyAdvancedFields(pendingDeferredFlags, pendingDeferredFields);
+
+  if ((pendingDeferredFlags & RACELINK_FLAG_POWER_ON) &&
+      !(pendingDeferredFlags & RACELINK_FLAG_HAS_BRI)) {
+    if (pendingDeferredBri != bri) {
+      bri = pendingDeferredBri;
+      stateUpdated(CALL_MODE_NO_NOTIFY);
+    }
+  }
+
+  mergeFieldsIntoSnapshot(pendingDeferredFields);
+  current.brightness = bri;
+
+  // Promote the captured offset to the device's persistent phase offset.
+  // Adjusts strip.timebase by the delta so direct-time-based effects
+  // (Breathe, Pacifica, ...) immediately get the configured phase shift
+  // without waiting for the next SYNC.
+  setActivePhaseOffsetMs((int32_t)pendingDeferredOffsetMs);
+
+  pendingDeferred = false;
+}
+
+// ========= Phase-offset re-assert (after HARD sync only) =========
+// strip.timebase has just been written to the master-aligned desiredTb
+// (no offset baked in). Subtract activePhaseOffsetMs so this device's
+// strip.now runs that many ms behind master. SOFT sync does NOT call
+// this — it converges naturally because err is computed against the
+// logical timebase (strip.timebase + activePhaseOffsetMs).
+void UsermodRaceLink::applyPhaseOffsetAfterHardSync() {
+  strip.timebase = (uint32_t)((int32_t)strip.timebase - activePhaseOffsetMs);
+}
+
+// ========= Switch active phase offset =========
+// Transitions activePhaseOffsetMs from its current value to ``newOffsetMs``,
+// adjusting strip.timebase by the delta so the device's effective phase
+// shift updates immediately (no need to wait for the next SYNC). Used by
+// apply paths to switch into / out of offset mode and to update the offset
+// when a new effect arrives with a different per-group value.
+void UsermodRaceLink::setActivePhaseOffsetMs(int32_t newOffsetMs) {
+  const int32_t delta = activePhaseOffsetMs - newOffsetMs;
+  strip.timebase = (uint32_t)((int32_t)strip.timebase + delta);
+  activePhaseOffsetMs = newOffsetMs;
+}
+
+void UsermodRaceLink::mergeFieldsIntoSnapshot(const AdvancedFields& f) {
+  using namespace RaceLinkProto;
+  AdvancedFields& snap = current.fields;
+  if (f.fieldMask & RL_CTRL_F_BRIGHTNESS) snap.brightness = f.brightness;
+  if (f.fieldMask & RL_CTRL_F_MODE)       snap.mode       = f.mode;
+  if (f.fieldMask & RL_CTRL_F_SPEED)      snap.speed      = f.speed;
+  if (f.fieldMask & RL_CTRL_F_INTENSITY)  snap.intensity  = f.intensity;
+  if (f.fieldMask & RL_CTRL_F_CUSTOM1)    snap.custom1    = f.custom1;
+  if (f.fieldMask & RL_CTRL_F_CUSTOM2)    snap.custom2    = f.custom2;
+  if (f.fieldMask & RL_CTRL_F_CUSTOM3_CHECKS) {
+    snap.custom3 = f.custom3;
+    snap.check1  = f.check1;
+    snap.check2  = f.check2;
+    snap.check3  = f.check3;
+  }
+  if (f.extMask & RL_CTRL_E_PALETTE) snap.palette = f.palette;
+  if (f.extMask & RL_CTRL_E_COLOR1)  snap.color1  = f.color1;
+  if (f.extMask & RL_CTRL_E_COLOR2)  snap.color2  = f.color2;
+  if (f.extMask & RL_CTRL_E_COLOR3)  snap.color3  = f.color3;
+  snap.fieldMask |= f.fieldMask;
+  snap.extMask   |= f.extMask;
+  current.lastUpdateMs = millis();
 }
 
 // ========= SYNC handler (global, irregular arrival OK) =========
-void UsermodRaceLink::handleSync(uint32_t ts24, uint8_t briFromPkt) {
+// ``syncFlags`` carries SYNC_FLAG_* bits from the 5 B SYNC form (or 0 for
+// the legacy 4 B form). Timebase unwrap + correction is unconditional;
+// pending arm-on-sync materialisation is gated on SYNC_FLAG_TRIGGER_ARMED
+// so an autosync pulse cannot fire armed effects ahead of the scene
+// runner's deliberate sync.
+void UsermodRaceLink::handleSync(uint32_t ts24, uint8_t briFromPkt, uint8_t syncFlags) {
+  using namespace RaceLinkProto;  // for SYNC_FLAG_TRIGGER_ARMED
+  const bool fireArmed = (syncFlags & SYNC_FLAG_TRIGGER_ARMED) != 0;
   const uint32_t nowMs = millis();
 
 // ---- unwrap 24-bit master timestamp (ms) to monotonic 32-bit ----
@@ -906,13 +2057,24 @@ lastSyncLocalMs = nowMs;
   // ---- compute desired WLED timebase (wrap-safe) ----
   const uint32_t desiredTb = (uint32_t)(masterEpochAbsMs - nowMs);
 
-  const int32_t err = (int32_t)(desiredTb - (uint32_t)strip.timebase);
+  // Drift correction is computed against the LOGICAL (master-aligned)
+  // timebase = strip.timebase + activePhaseOffsetMs. Without this, a
+  // non-zero activePhaseOffsetMs would always look like err ==
+  // activePhaseOffsetMs and trigger endless hard-resyncs.
+  const uint32_t logicalTb = (uint32_t)((int32_t)strip.timebase + activePhaseOffsetMs);
+  const int32_t err = (int32_t)(desiredTb - logicalTb);
   lastSyncTbErrMs = err; // debug/info
   const uint32_t aerr = (err < 0) ? (uint32_t)(-err) : (uint32_t)err;
 
-  const bool hard = pending.armed || (aerr > (uint32_t)RACELINK_SYNC_HARD_RESYNC_MS);
+  const bool hard = pending.valid || (aerr > (uint32_t)RACELINK_SYNC_HARD_RESYNC_MS);
   if (hard) {
+    // Hard reset to master-aligned timebase, then re-bake the per-device
+    // phase offset (so cyclic effects keep their phase relative to other
+    // groups). Soft sync below does NOT need this — its step is computed
+    // against logicalTb, so strip.timebase converges to desiredTb -
+    // activePhaseOffsetMs naturally.
     strip.timebase = desiredTb;
+    applyPhaseOffsetAfterHardSync();
   } else {
     int32_t step = err;
     if (step > (int32_t)RACELINK_SYNC_MAX_STEP_MS) step = (int32_t)RACELINK_SYNC_MAX_STEP_MS;
@@ -920,39 +2082,63 @@ lastSyncLocalMs = nowMs;
     strip.timebase = (uint32_t)((int32_t)strip.timebase + step);
   }
 
-  // ---- start pending preset exactly on first SYNC after CONFIG ----
-  if (pending.armed) {
-    uint16_t prevTT = 0;
-    const bool ttForced = (pending.flags & RACELINK_FLAG_FORCE_TT0) != 0;
-    if (ttForced) { prevTT = transitionDelay; transitionDelay = 0; }
+  // ---- apply pending CONTROL on first TRIGGER SYNC after it was armed ----
+  // Gate on SYNC_FLAG_TRIGGER_ARMED: only the deliberate fire from the host
+  // (scene runner / operator) clears `pending.valid`. Autosync pulses skip
+  // this block entirely so they cannot race the deliberate sync.
+  if (fireArmed && pending.valid) {
+    // Materialise any queued offset-mode change *first*: the queued effect
+    // semantically belongs to the new mode. This is the second of two
+    // materialisation sites (the immediate-apply path materialises in the
+    // dispatch switch before invoking handleControl). After this, future
+    // OPC_CONTROL/OPC_PRESET packets see the new activeMode for gate checks.
+    materialisePendingChange();
 
-    const bool needApply = ((pending.flags & RACELINK_FLAG_FORCE_REAPPLY) != 0) || (currentPreset != pending.presetId);
-    if (needApply) {
-      applyPreset(pending.presetId, CALL_MODE_NO_NOTIFY);
+    // Two paths depending on whether the arming CONTROL requested an offset:
+    //   offsetMs == 0 -> apply immediately (legacy fast path; zero overhead)
+    //   offsetMs >  0 -> snapshot state and defer until ``millis() + offsetMs``;
+    //                    the per-loop ``serviceDeferredApply()`` runs the apply.
+    if (pending.offsetMs == 0) {
+      applyAdvancedFields(current.flags, pending.fields);
+
+      // If the queued CONTROL had no brightness but POWER_ON is set, take live
+      // brightness from the SYNC packet.
+      if ((current.flags & RACELINK_FLAG_POWER_ON) &&
+          !(current.flags & RACELINK_FLAG_HAS_BRI)) {
+        if (briFromPkt != bri) {
+          bri = briFromPkt;
+          stateUpdated(CALL_MODE_NO_NOTIFY);
+        }
+      }
+
+      mergeFieldsIntoSnapshot(pending.fields);
+      current.brightness = bri;
+
+      // Group with offset 0 (or no offset mode) → transition to a 0 offset.
+      // Adjusts strip.timebase by the delta so the running effect's phase
+      // is correct immediately, without waiting for the next SYNC.
+      setActivePhaseOffsetMs(0);
+
+      pending.valid = false;
+      return;
     }
 
-    // Brightness: use CONFIG.bri only if RACELINK_FLAG_HAS_BRI is set.
-    // If CONFIG did NOT include brightness, take it from SYNC packet (live brightness).
-    if (!(pending.flags & RACELINK_FLAG_POWER_ON)) {
-      bri = 0;
-    } else if (pending.flags & RACELINK_FLAG_HAS_BRI) {
-      bri = pending.bri;
-    } else {
-      bri = briFromPkt;
-    }
-    stateUpdated(CALL_MODE_NO_NOTIFY);
+    // Deferred path: snapshot everything we need so a subsequent OPC_OFFSET
+    // / OPC_CONTROL packet between now and the deadline does not shift this
+    // queued effect. ``handleControl()`` clears ``pendingDeferred`` if a
+    // brand-new CONTROL re-arms before the deadline.
+    pendingDeferredFlags    = current.flags;
+    pendingDeferredBri      = briFromPkt;
+    pendingDeferredFields   = pending.fields;
+    pendingDeferredAt       = nowMs + pending.offsetMs;
+    pendingDeferredOffsetMs = pending.offsetMs;  // captured for serviceDeferredApply
+    pendingDeferred         = true;
 
-    current.flags      = pending.flags;
-    current.presetId   = pending.presetId;
-    current.brightness = bri;
-
-    pending.armed = false;
-
-    if (ttForced) transitionDelay = prevTT;
+    pending.valid = false;
     return;
   }
 
-  // ---- optional live brightness via SYNC (only if last CONFIG had NO brightness) ----
+  // ---- optional live brightness via SYNC (only if last CONTROL had NO brightness) ----
   if (haveControl && !(current.flags & RACELINK_FLAG_HAS_BRI)) {
     const uint8_t desiredBri = (current.flags & RACELINK_FLAG_POWER_ON) ? briFromPkt : 0;
     if (desiredBri != bri) {
@@ -964,9 +2150,10 @@ lastSyncLocalMs = nowMs;
 }
 
 
-// --- Callback-Brücken als statische Member ---
+// --- Callback bridges as static members ---
 void UsermodRaceLink::on_rx_node(const uint8_t* pkt, uint8_t len,
-                                        int16_t rssi, int8_t snr, void* ctx) {
+                                        int16_t rssi, int8_t snr,
+                                        void* ctx) {
   auto* self = static_cast<UsermodRaceLink*>(ctx);
   if (!self || !pkt || len == 0) return;
 
@@ -981,7 +2168,7 @@ void UsermodRaceLink::on_rx_node(const uint8_t* pkt, uint8_t len,
 /* void UsermodRaceLink::on_tx_done_node(void* ctx) {
   auto* self = static_cast<UsermodRaceLink*>(ctx);
   if (!self) return;
-  // Optional: Node-spezifische TX-Events
+  // Optional: node-specific TX events
 } */
 
 // ========= MAC helpers =========

@@ -3,6 +3,10 @@
 #include "racelink_epaper.h"
 #include <SPI.h>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+
 // base class GxEPD2_GFX can be used to pass references or pointers to the display instance as parameter, uses ~1.2k more code
 #define ENABLE_GxEPD2_GFX 0
 #include <GxEPD2_BW.h>
@@ -13,32 +17,13 @@
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeMonoBold9pt7b.h>
 
-// -----------------------------
-// Pin defaults (override via PlatformIO build_flags: -D ...)
-// -----------------------------
-#ifndef RACELINK_EPAPER_CS
-  #define RACELINK_EPAPER_CS   10
-#endif
-#ifndef RACELINK_EPAPER_BUSY
-  #define RACELINK_EPAPER_BUSY 3
-#endif
-#ifndef RACELINK_EPAPER_RST
-  #define RACELINK_EPAPER_RST  46
-#endif
-#ifndef RACELINK_EPAPER_DC
-  #define RACELINK_EPAPER_DC   9
-#endif
-
-// Configurable SPI pins (MISO is typically not used by ePaper modules)
-#ifndef RACELINK_EPAPER_MOSI
-  #define RACELINK_EPAPER_MOSI 11
-#endif
-#ifndef RACELINK_EPAPER_SCK
-  #define RACELINK_EPAPER_SCK  12
-#endif
-#ifndef RACELINK_EPAPER_MISO
-  #define RACELINK_EPAPER_MISO -1
-#endif
+// Pin assignments are now runtime parameters supplied via epaperInit().
+// The old compile-time defines (RACELINK_EPAPER_MOSI etc.) live in
+// racelink_wled.h as defaults that seed the UsermodRaceLink::epd* members.
+// At static-init time we instantiate the GxEPD2 display with -1 placeholder
+// pins (safe — GxEPD2_EPD's constructor only stores pin numbers, no GPIO
+// activation happens until display.init() runs). The worker task writes
+// the real pin numbers via display.epd2.setPins() before calling init().
 
 // -----------------------------
 // Deferred refresh behavior
@@ -76,6 +61,20 @@
   #define RACELINK_EPAPER_USE_HIBERNATE 1
 #endif
 
+// -----------------------------
+// Async worker tuning
+// -----------------------------
+// Stack must accommodate Adafruit GFX + GxEPD2 paging buffer access + four embedded fonts.
+#ifndef RACELINK_EPAPER_TASK_STACK
+  #define RACELINK_EPAPER_TASK_STACK 8192
+#endif
+
+// Match Arduino loop priority (1) so the single-core S2 time-slices fairly.
+// On dual-core S3 the task is pinned to core 0 and runs in parallel anyway.
+#ifndef RACELINK_EPAPER_TASK_PRIORITY
+  #define RACELINK_EPAPER_TASK_PRIORITY 1
+#endif
+
 // Dedicated SPI bus for ePaper (keep RaceLink on default SPI)
 #if defined(HSPI)
 static SPIClass epdSPI(HSPI);
@@ -85,9 +84,9 @@ static SPIClass epdSPI;
 
 /* 2.9'' EPD Module (B/W), DEPG0290BS 128x296, SSD1680
 GxEPD2_290_BS.h, GxEPD2_290_BS.cpp: no changes */
-// static GxEPD2_BW<GxEPD2_290_BS, GxEPD2_290_BS::HEIGHT> display(
-//   GxEPD2_290_BS(/*CS=*/ RACELINK_EPAPER_CS, /*DC=*/ RACELINK_EPAPER_DC, /*RES=*/ RACELINK_EPAPER_RST, /*BUSY=*/ RACELINK_EPAPER_BUSY)
-// );
+// (legacy alternative panel reference — left here as a guide if the
+// hardware ever switches back; keep in sync with the configurable wrapper
+// pattern below if uncommented.)
 
 
 /* 3.7'' EPD Module, GDEY037T03 240x416, UC8253
@@ -97,28 +96,78 @@ GxEPD2_370_GDEY037T03.h:
     static const bool hasFastPartialUpdate = false; // set this false to force full refresh always
     static const bool useFastFullUpdate = false; // set false for extended (low) temperature range, 1005000us vs 2950000us
 */
-static GxEPD2_BW<GxEPD2_370_GDEY037T03, GxEPD2_370_GDEY037T03::HEIGHT> display(
- GxEPD2_370_GDEY037T03(/*CS=5*/ RACELINK_EPAPER_CS, /*DC=*/ RACELINK_EPAPER_DC, /*RES=*/ RACELINK_EPAPER_RST, /*BUSY=*/ RACELINK_EPAPER_BUSY)
+
+// GxEPD2_EPD's _cs/_dc/_rst/_busy are protected: derive a thin wrapper that
+// inherits the constructor and exposes a setPins() method so we can apply
+// runtime-configured pin numbers before display.init() is called. This avoids
+// reaching into protected members via static_cast tricks (which would be UB).
+class GxEPD2_370_GDEY037T03_Configurable : public GxEPD2_370_GDEY037T03
+{
+public:
+  using GxEPD2_370_GDEY037T03::GxEPD2_370_GDEY037T03;   // inherit constructors
+  void setPins(int16_t cs, int16_t dc, int16_t rst, int16_t busy)
+  {
+    _cs   = cs;
+    _dc   = dc;
+    _rst  = rst;
+    _busy = busy;
+  }
+};
+
+// Instantiate with -1 placeholder pins. The real pin numbers are written by
+// epaperInit() into display.epd2.setPins() *before* the worker task calls
+// display.init(); this is safe because GxEPD2_EPD's constructor only stores
+// the pin numbers — no pinMode / digitalWrite happens until init() runs.
+static GxEPD2_BW<GxEPD2_370_GDEY037T03_Configurable, GxEPD2_370_GDEY037T03_Configurable::HEIGHT> display(
+ GxEPD2_370_GDEY037T03_Configurable(/*CS=*/ -1, /*DC=*/ -1, /*RES=*/ -1, /*BUSY=*/ -1)
 );
 
 // -----------------------------
 // State
 // -----------------------------
+// Pilot data: written by main (under mutex), snapshotted by worker (under mutex).
 static uint8_t g_numPilots = 1;
-
 static char g_nick[8][21];   // max 20 chars + NUL
 static char g_label[8][3];   // max 2 chars + NUL
 
-static bool g_initialized = false; // true once epaperInit() was called
-static bool g_hibernated = false; // true if display is currently hibernated
-static bool g_hasPilotData = false; // true once at least one pilot slot has received data
+// Cross-thread status flags. `volatile` because the writer and reader live on
+// different FreeRTOS tasks (and on S3, different cores).
+static volatile bool g_initialized = false; // worker sets after first init+render; main reads in service_epaper
+static bool g_hibernated = false;            // worker-only state
+static bool g_hasPilotData = false;          // main-only state
 
-static bool g_refreshPending = false; // set to true to request a deferred refresh executed by service_epaper()
-static uint32_t g_lastNewDataMs = 0;  // last received update command
-static uint32_t g_firstNewDataMs = 0; // first update command since last refresh (used to enforce max defer time)
-static uint32_t g_lastRefreshMs = 0; // last refresh (full or partial)
-static uint32_t g_lastFullRefreshMs = 0; // last full refresh (used to enforce periodic full refreshes)
-static uint8_t g_partialRefreshCount = 0; // number of partial refreshes since last full refresh (used to enforce full refresh after too many partial refreshes)
+// Deferred-refresh bookkeeping (main-thread-only).
+static bool g_refreshPending = false;
+static uint32_t g_lastNewDataMs = 0;
+static uint32_t g_firstNewDataMs = 0;
+
+// Refresh timestamps/counters: written by worker after each refresh, read by main in service_epaper.
+static volatile uint32_t g_lastRefreshMs = 0;
+static volatile uint32_t g_lastFullRefreshMs = 0;
+static volatile uint8_t g_partialRefreshCount = 0;
+
+// -----------------------------
+// Async worker plumbing
+// -----------------------------
+static TaskHandle_t      g_epdTaskHandle = nullptr;
+static SemaphoreHandle_t g_epdWake       = nullptr; // binary, given by main, taken by worker
+static SemaphoreHandle_t g_epdDataMutex  = nullptr; // protects g_nick / g_label / g_numPilots
+
+static volatile bool g_epdReqInit    = false; // request: run SPI begin + display.init + start screen
+static volatile bool g_epdReqRefresh = false; // request: re-render with current snapshot
+static volatile bool g_epdReqFull    = false; // refresh kind selected by main at dispatch time
+static volatile bool g_epdBusy       = false; // worker is currently mid-init or mid-render
+
+// -----------------------------
+// Pin assignments (set by epaperInit, read by the worker task)
+// -----------------------------
+static int8_t g_epdSck  = -1;
+static int8_t g_epdMiso = -1;
+static int8_t g_epdMosi = -1;
+static int8_t g_epdCs   = -1;
+static int8_t g_epdDc   = -1;
+static int8_t g_epdRst  = -1;
+static int8_t g_epdBusy_pin = -1;   // suffix avoids clash with g_epdBusy (busy-flag) above
 
 // -----------------------------
 // Helpers
@@ -220,8 +269,11 @@ static void drawCenteredText(const char* txt, const GFXfont* font, int16_t areaX
 }
 
 // -----------------------------
-// Rendering
+// Rendering (worker-context only)
 // -----------------------------
+// Render functions read from caller-supplied snapshot buffers, never the live
+// g_nick / g_label / g_numPilots — so updates from the main thread cannot tear
+// the picture mid-render.
 static void renderStartScreen()
 {
   display.setRotation(1); // landscape
@@ -243,7 +295,7 @@ static void renderStartScreen()
   while (display.nextPage());
 }
 
-static void renderLayout1(bool fullRefresh)
+static void renderLayout1(bool fullRefresh, const char* nickUpper, const char* labelUpper)
 {
   display.setRotation(1);
   const uint16_t W = display.width();
@@ -265,7 +317,6 @@ static void renderLayout1(bool fullRefresh)
   const uint16_t nickMaxW = (leftW > (2 * leftPadX)) ? (leftW - 2 * leftPadX) : leftW;
   const uint16_t nickMaxH = H - 8;
 
-  const char* nickUpper = g_nick[0];
   const GFXfont* nickFont = pickFontFit(nickUpper, nickMaxW, nickMaxH);
 
   if (fullRefresh) display.setFullWindow();
@@ -293,23 +344,24 @@ static void renderLayout1(bool fullRefresh)
     display.setFont(labelFont);
     display.setTextColor(GxEPD_WHITE);
 
-    display.getTextBounds(g_label[0], 0, 0, &tbx, &tby, &tbw, &tbh);
+    display.getTextBounds(labelUpper, 0, 0, &tbx, &tby, &tbw, &tbh);
     int16_t rX = int16_t(barX) + int16_t((barW - tbw) / 2) - tbx;
     int16_t rY = int16_t(H / 2) - int16_t(tbh / 2) - tby;
 
     display.setCursor(rX, rY);
-    display.print(g_label[0]);
+    display.print(labelUpper);
   }
   while (display.nextPage());
 }
 
-static void renderLayoutMulti(bool fullRefresh)
+static void renderLayoutMulti(bool fullRefresh, uint8_t n, const char nick[8][21], const char lbl[8][3])
 {
   display.setRotation(1);
   const uint16_t W = display.width();
   const uint16_t H = display.height();
 
-  const uint8_t n = g_numPilots;
+  if (n < 1) n = 1;
+  if (n > 8) n = 8;
   const uint16_t rowH = H / n;
 
   const GFXfont* labelFont = pickLabelFont(rowH);
@@ -336,7 +388,7 @@ static void renderLayoutMulti(bool fullRefresh)
       display.fillRect(barX, y0, barW, rowH, GxEPD_BLACK);
 
       // nickname
-      const char* nickUpper = g_nick[i];
+      const char* nickUpper = nick[i];
       const GFXfont* nickFont = pickFontFit(nickUpper, nickMaxW, nickMaxH);
 
       display.setFont(nickFont);
@@ -355,21 +407,21 @@ static void renderLayoutMulti(bool fullRefresh)
       display.setFont(labelFont);
       display.setTextColor(GxEPD_WHITE);
 
-      display.getTextBounds(g_label[i], 0, 0, &tbx, &tby, &tbw, &tbh);
+      display.getTextBounds(lbl[i], 0, 0, &tbx, &tby, &tbw, &tbh);
       int16_t rX = int16_t(barX) + int16_t((barW - tbw) / 2) - tbx;
       int16_t rY = int16_t(y0 + rowH / 2) - int16_t(tbh / 2) - tby;
 
       display.setCursor(rX, rY);
-      display.print(g_label[i]);
+      display.print(lbl[i]);
     }
   }
   while (display.nextPage());
 }
 
-static void renderAll(bool fullRefresh)
+static void renderAll(bool fullRefresh, uint8_t n, const char nick[8][21], const char lbl[8][3])
 {
-  if (g_numPilots == 1) renderLayout1(fullRefresh);
-  else renderLayoutMulti(fullRefresh);
+  if (n <= 1) renderLayout1(fullRefresh, nick[0], lbl[0]);
+  else        renderLayoutMulti(fullRefresh, n, nick, lbl);
 }
 
 static void wakeIfNeeded()
@@ -395,53 +447,154 @@ static void maybeHibernate()
 static void scheduleDeferredRefresh()
 {
   const uint32_t now = millis();
-  if (!g_refreshPending) g_firstNewDataMs = now; // if no refresh pending, this is the first new data; otherwise, keep the original firstNewDataMs to enforce max defer time correctly
-  g_lastNewDataMs = now; // always update lastNewDataMs to enable dueByDelay calculation
+  if (!g_refreshPending) g_firstNewDataMs = now; // first new-data event of the current defer window
+  g_lastNewDataMs = now;
   g_refreshPending = true;
 }
 
-static void performRefresh(bool fullRefresh)
+// -----------------------------
+// Worker task
+// -----------------------------
+// Owns ALL access to the GxEPD2 `display` object. Wakes on g_epdWake, processes
+// any pending init or refresh request, then blocks again. The wake-semaphore is
+// binary, so multiple gives during a single render coalesce into one extra cycle.
+static void epaperTask(void* /*arg*/)
 {
-  wakeIfNeeded();
-  renderAll(fullRefresh);
-  const uint32_t now = millis();
-  g_lastRefreshMs = now;
-  if (fullRefresh)
+  for (;;)
   {
-    g_lastFullRefreshMs = now;
-    g_partialRefreshCount = 0;
+    if (xSemaphoreTake(g_epdWake, portMAX_DELAY) != pdTRUE) continue;
+
+    if (g_epdReqInit)
+    {
+      g_epdReqInit = false;
+      g_epdBusy = true;
+
+      // Apply runtime-configured pins to the GxEPD2 display before init().
+      // Constructor pins were -1 sentinels; setPins() updates the protected
+      // _cs/_dc/_rst/_busy members so display.init() will pinMode the right
+      // GPIOs.
+      display.epd2.setPins(g_epdCs, g_epdDc, g_epdRst, g_epdBusy_pin);
+
+      epdSPI.begin(g_epdSck, g_epdMiso, g_epdMosi, g_epdCs);
+      display.epd2.selectSPI(epdSPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));
+      display.init(115200, false, 50, false); // reset duration was 50
+      g_hibernated = false;
+
+      renderStartScreen();
+      const uint32_t now = millis();
+      g_lastRefreshMs = now;
+      g_lastFullRefreshMs = now;
+      g_partialRefreshCount = 0;
+      maybeHibernate();
+
+      g_initialized = true; // gate must close only after the panel has shown the boot screen
+      g_epdBusy = false;
+    }
+
+    if (g_epdReqRefresh)
+    {
+      g_epdReqRefresh = false;
+      g_epdBusy = true;
+      const bool full = g_epdReqFull;
+
+      // Snapshot pilot data under the mutex so the main thread can keep updating g_nick/g_label freely.
+      uint8_t n = 1;
+      char nick[8][21];
+      char lbl[8][3];
+      if (g_epdDataMutex && xSemaphoreTake(g_epdDataMutex, portMAX_DELAY) == pdTRUE)
+      {
+        n = g_numPilots;
+        memcpy(nick, g_nick, sizeof(nick));
+        memcpy(lbl,  g_label, sizeof(lbl));
+        xSemaphoreGive(g_epdDataMutex);
+      }
+      else
+      {
+        // Mutex unavailable (shouldn't happen post-init) — fall back to direct read.
+        n = g_numPilots;
+        memcpy(nick, g_nick, sizeof(nick));
+        memcpy(lbl,  g_label, sizeof(lbl));
+      }
+
+      wakeIfNeeded();
+      renderAll(full, n, nick, lbl);
+      maybeHibernate();
+
+      const uint32_t now = millis();
+      g_lastRefreshMs = now;
+      if (full)
+      {
+        g_lastFullRefreshMs = now;
+        g_partialRefreshCount = 0;
+      }
+      else if (g_partialRefreshCount < 255)
+      {
+        g_partialRefreshCount++;
+      }
+
+      g_epdBusy = false;
+    }
   }
-  else if (g_partialRefreshCount < 255)
-  {
-    g_partialRefreshCount++;
-  }
-  maybeHibernate();
 }
 
 // -----------------------------
-// Public API
+// Public API (non-blocking)
 // -----------------------------
-void epaperInit()
+void epaperInit(int8_t mosi, int8_t sck, int8_t miso,
+                int8_t cs,   int8_t dc,  int8_t rst, int8_t busy)
 {
-  epdSPI.begin(RACELINK_EPAPER_SCK, RACELINK_EPAPER_MISO, RACELINK_EPAPER_MOSI, RACELINK_EPAPER_CS);
-  display.epd2.selectSPI(epdSPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));
+  // Stash the pin assignments for the worker task. setPins() runs on the
+  // worker before display.init(), so reading these from the main thread is
+  // safe — they're written here once and never change for the lifetime of
+  // the device (UI changes trigger a reboot).
+  g_epdSck      = sck;
+  g_epdMiso     = miso;
+  g_epdMosi     = mosi;
+  g_epdCs       = cs;
+  g_epdDc       = dc;
+  g_epdRst      = rst;
+  g_epdBusy_pin = busy;
 
-  display.init(115200, false, 50, false); // reset duration was 50
-  g_initialized = true;
-  g_hibernated = false;
-
+  // Initialize main-thread state before the worker can observe it.
   for (uint8_t i = 0; i < 8; i++)
   {
     g_nick[i][0]  = '\0';
     g_label[i][0] = '\0';
   }
   g_numPilots = 1;
-
-  renderStartScreen();
-  g_lastRefreshMs = millis();
-  g_lastFullRefreshMs = g_lastRefreshMs;
+  g_hasPilotData = false;
+  g_refreshPending = false;
+  g_lastNewDataMs = 0;
+  g_firstNewDataMs = 0;
+  g_lastRefreshMs = 0;
+  g_lastFullRefreshMs = 0;
   g_partialRefreshCount = 0;
-  maybeHibernate();
+  g_hibernated = false;
+  g_initialized = false;
+  g_epdBusy = false;
+
+  if (!g_epdDataMutex) g_epdDataMutex = xSemaphoreCreateMutex();
+  if (!g_epdWake)      g_epdWake      = xSemaphoreCreateBinary();
+
+  if (g_epdTaskHandle == nullptr)
+  {
+  #if defined(CONFIG_IDF_TARGET_ESP32S3)
+    const BaseType_t coreId = 0;          // S3: pin worker to core 0; Arduino loop owns core 1.
+  #else
+    const BaseType_t coreId = tskNO_AFFINITY; // S2 (single core) and others.
+  #endif
+    xTaskCreatePinnedToCore(epaperTask,
+                            "epaper",
+                            RACELINK_EPAPER_TASK_STACK,
+                            nullptr,
+                            RACELINK_EPAPER_TASK_PRIORITY,
+                            &g_epdTaskHandle,
+                            coreId);
+  }
+
+  // Tell the worker to do the heavy SPI/init/start-screen work, then return immediately.
+  g_epdReqInit = true;
+  if (g_epdWake) xSemaphoreGive(g_epdWake);
 }
 
 void setDisplayLayout(uint8_t numPilots)
@@ -449,12 +602,24 @@ void setDisplayLayout(uint8_t numPilots)
   if (numPilots < 1) numPilots = 1;
   if (numPilots > 8) numPilots = 8;
 
-  g_numPilots = numPilots;
-
-  for (uint8_t i = numPilots; i < 8; i++)
+  if (g_epdDataMutex && xSemaphoreTake(g_epdDataMutex, portMAX_DELAY) == pdTRUE)
   {
-    g_nick[i][0]  = '\0';
-    g_label[i][0] = '\0';
+    g_numPilots = numPilots;
+    for (uint8_t i = numPilots; i < 8; i++)
+    {
+      g_nick[i][0]  = '\0';
+      g_label[i][0] = '\0';
+    }
+    xSemaphoreGive(g_epdDataMutex);
+  }
+  else
+  {
+    g_numPilots = numPilots;
+    for (uint8_t i = numPilots; i < 8; i++)
+    {
+      g_nick[i][0]  = '\0';
+      g_label[i][0] = '\0';
+    }
   }
 
   // If we already have pilot data, schedule a refresh so the new layout becomes visible
@@ -464,19 +629,30 @@ void setDisplayLayout(uint8_t numPilots)
 bool setPilotSlotData(const char* nickname, const char* raceLabel, uint8_t slot)
 {
   if (slot < 1 || slot > 8) return false;
-  if (slot > g_numPilots) return false;
 
-  const uint8_t idx = slot - 1;
+  bool accepted = false;
+  if (g_epdDataMutex && xSemaphoreTake(g_epdDataMutex, portMAX_DELAY) == pdTRUE)
+  {
+    if (slot <= g_numPilots)
+    {
+      const uint8_t idx = slot - 1;
 
-  // nickname: max 20 chars, stored uppercase
-  char tmpNick[21];
-  safeCopyTrunc(nickname, tmpNick, sizeof(tmpNick));
-  toUpperAscii(tmpNick, g_nick[idx], sizeof(g_nick[idx]));
+      // nickname: max 20 chars, stored uppercase
+      char tmpNick[21];
+      safeCopyTrunc(nickname, tmpNick, sizeof(tmpNick));
+      toUpperAscii(tmpNick, g_nick[idx], sizeof(g_nick[idx]));
 
-  // label: max 2 chars, stored uppercase
-  char tmpLbl[3];
-  safeCopyTrunc(raceLabel, tmpLbl, sizeof(tmpLbl));
-  toUpperAscii(tmpLbl, g_label[idx], sizeof(g_label[idx]));
+      // label: max 2 chars, stored uppercase
+      char tmpLbl[3];
+      safeCopyTrunc(raceLabel, tmpLbl, sizeof(tmpLbl));
+      toUpperAscii(tmpLbl, g_label[idx], sizeof(g_label[idx]));
+
+      accepted = true;
+    }
+    xSemaphoreGive(g_epdDataMutex);
+  }
+
+  if (!accepted) return false;
 
   g_hasPilotData = true;
   scheduleDeferredRefresh();
@@ -486,13 +662,14 @@ bool setPilotSlotData(const char* nickname, const char* raceLabel, uint8_t slot)
 void service_epaper()
 {
   if (!g_initialized) return;
+  if (g_epdBusy) return; // worker is still rendering; try again next tick
 
   const uint32_t now = millis();
 
-  const bool minOk = (uint32_t)(now - g_lastRefreshMs) >= (uint32_t)RACELINK_EPAPER_MIN_REFRESH_INTERVAL_MS; // checked: good
+  const bool minOk = (uint32_t)(now - g_lastRefreshMs) >= (uint32_t)RACELINK_EPAPER_MIN_REFRESH_INTERVAL_MS;
   if (!minOk) return; // enforce minimum interval between refreshes to prevent issues on some panels when refreshing too frequently
 
-  if(!g_hasPilotData) return; // no data yet, nothing to do
+  if (!g_hasPilotData) return; // no data yet, nothing to do
 
   // Deferred refresh after updates
   if (g_refreshPending)
@@ -513,8 +690,10 @@ void service_epaper()
 
     if (dueByDelay || dueByMax)
     {
-      performRefresh(fullRefreshDue);
+      g_epdReqFull = fullRefreshDue;
+      g_epdReqRefresh = true;
       g_refreshPending = false;
+      if (g_epdWake) xSemaphoreGive(g_epdWake);
     }
   }
   else
@@ -524,14 +703,18 @@ void service_epaper()
     {
       if ((uint32_t)(now - g_lastFullRefreshMs) >= (uint32_t)RACELINK_EPAPER_PERIODIC_FULL_REFRESH_MS)
       {
-        performRefresh(true);
+        g_epdReqFull = true;
+        g_epdReqRefresh = true;
+        if (g_epdWake) xSemaphoreGive(g_epdWake);
       }
     }
     else if (RACELINK_EPAPER_MAINTENANCE_REFRESH_MS > 0)
     {
       if ((uint32_t)(now - g_lastRefreshMs) >= (uint32_t)RACELINK_EPAPER_MAINTENANCE_REFRESH_MS)
       {
-        performRefresh(true);
+        g_epdReqFull = true;
+        g_epdReqRefresh = true;
+        if (g_epdWake) xSemaphoreGive(g_epdWake);
       }
     }
   }
