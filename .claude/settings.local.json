@@ -117,7 +117,29 @@
       "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\platformio.exe\" run -e RaceLink_Node_v4_s3_llcc68 2>&1 | Select-Object -Last 6)",
       "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\platformio.exe\" run -e RaceLink_Node_v3_s2_llcc68 2>&1 | Select-Object -Last 6)",
       "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\platformio.exe\" run -e RaceLink_Node_v1_c3_ct62 2>&1 | Select-Object -Last 6)",
-      "Bash(ls -la \"C:\\\\\\\\Users\\\\\\\\psima\\\\\\\\Dev\\\\\\\\WLED LoRa\\\\\\\\WLED\\\\\\\\usermods\\\\\\\\racelink_wled\\\\\\\\\")"
+      "Bash(ls -la \"C:\\\\\\\\Users\\\\\\\\psima\\\\\\\\Dev\\\\\\\\WLED LoRa\\\\\\\\WLED\\\\\\\\usermods\\\\\\\\racelink_wled\\\\\\\\\")",
+      "Bash(awk 'END {print NR}' \"C:/Users/psima/Dev/WLED LoRa/WLED/usermods/racelink_wled/racelink_wled.cpp\")",
+      "Bash(pio --version)",
+      "Bash(ls \"C:/Users/psima/Dev/\" 2>&1 | head -30)",
+      "Read(//c/Users/psima/Dev/**)",
+      "Bash(Get-ChildItem -Path \"usermods/racelink_wled\" -Recurse)",
+      "Bash(cd /c/Users/psima/Dev/\"WLED LoRa\"/WLED && find . -type f -name \"*.cpp\" -o -name \"*.h\" | grep -E \"\\(usermod|Preferences|EEPROM\\)\" | head -20)",
+      "Read(//c/c/Users/psima/Dev/WLED LoRa/**)",
+      "Bash(xargs grep -l \"cfg.json\")",
+      "Bash(pio run *)",
+      "PowerShell(pio run -e RaceLink_Node_v3_s2_llcc68 -e RaceLink_Node_v4_s3_llcc68 2>&1)",
+      "PowerShell(Get-Command platformio,pio -ErrorAction SilentlyContinue; Test-Path \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\")",
+      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -e RaceLink_Node_v3_s2_llcc68 -e RaceLink_Node_v4_s3_llcc68 2>&1 | Select-Object -Last 100)",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\psima\\\\Dev\\\\WLED LoRa\\\\WLED\\\\usermods\\\\racelink_wled\" -Recurse)",
+      "Bash(Select-Object FullName)",
+      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -e RaceLink_Node_v3_s2_llcc68 -e RaceLink_Node_v4_s3_llcc68 2>&1 | Select-Object -Last 60)",
+      "Bash(xargs grep -l -i \"developer\\\\|dev.guide\\\\|userguide\\\\|user.guide\")",
+      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -e RaceLink_Node_v3_s2_llcc68 -e RaceLink_Node_v4_s3_llcc68 2>&1 | Select-Object -Last 25)",
+      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -e RaceLink_Node_v3_s2_llcc68 -e RaceLink_Node_v4_s3_llcc68 2>&1 | Select-Object -Last 20)",
+      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -e RaceLink_Node_v3_s2_llcc68 2>&1 | Select-Object -Last 8)",
+      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -e RaceLink_Node_v3_s2_llcc68 2>&1 | Select-Object -Last 6)",
+      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -e RaceLink_Node_v3_s2_llcc68 2>&1 | Select-Object -Last 10)",
+      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -e RaceLink_Node_v3_s2_llcc68 -e RaceLink_Node_v4_s3_llcc68 2>&1 | Select-Object -Last 10)"
     ]
   }
 }

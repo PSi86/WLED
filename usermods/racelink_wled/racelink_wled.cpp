@@ -1,6 +1,7 @@
 #include "racelink_wled.h"
 //#include <WiFi.h>  // fallback for WiFi.macAddress()
 #include "pin_manager.h"
+#include "rf_config_nvs.h"
 
 #ifdef RACELINK_EPAPER
 #include "racelink_epaper.h"
@@ -8,6 +9,31 @@
 
 static RaceLinkTransport::Core rl{};
 static RaceLinkTransport::Callbacks cb{};
+
+// Currently active LoRa PHY configuration. Initialised in radioInit()
+// from NVS (with compile-time defaults as fallback) and consumed by
+// the PhyCfg builder. Updated by the OPC_RF_CONFIG handler before the
+// queued reboot so a same-boot GET_RF_CONFIG sees the new values.
+static RaceLinkProto::P_RfConfig g_activeRfConfig{};
+
+// Compile-time defaults expressed in the wire-format P_RfConfig layout.
+// Used as the first-boot seed (so a fresh node persists a valid slot
+// before its first OPC_RF_CONFIG) and as the boot-loop recovery target
+// after BOOT_COUNTER_MAX strikes. The WLED-side define names differ
+// from the gateway's (RACELINK_CR / RACELINK_SYNC_WORD vs the
+// gateway's RACELINK_CR_DEN / RACELINK_SYNCWORD), which is why the
+// helper lives at the call site rather than in rf_config_nvs.h.
+static inline RaceLinkProto::P_RfConfig getCompileDefaultRfConfig() {
+  RaceLinkProto::P_RfConfig c{};
+  c.freq_hz       = RACELINK_FREQ_HZ;
+  c.bw_khz_x10    = (uint16_t)(RACELINK_BW_KHZ * 10.0f + 0.5f);
+  c.sf            = RACELINK_SF;
+  c.cr_den        = RACELINK_CR;
+  c.sync_word     = RACELINK_SYNC_WORD;
+  c.tx_power_dbm  = (int8_t)RACELINK_TX_POWER;
+  c.preamble      = RACELINK_PREAMBLE;
+  return c;
+}
 
 // --- Last RX capture (for Info UI) ---
 static uint8_t lastRxRaw[64];
@@ -187,12 +213,42 @@ void UsermodRaceLink::setup() {
     }
   #endif
 
-  // Boot effect: operator did NOT set a boot preset -> show a random solid
-  // color so it is visible that the device has booted.
+  // Persistent boot color: rolled once on the very first boot (when cfg.json
+  // has no value yet -> overrides.bootColorMode stays at 0xFF), saved
+  // immediately so every subsequent boot reuses the same color. Operator can
+  // change it later via the 1-click cycle; serviceBootColorSave() persists
+  // the new pick after the post-click idle window. The runtime mirror in
+  // btn.* feeds both the boot display and the SCENE_RESTORE_BOOT_COLOR path,
+  // so the value is also kept consistent on units where bootPreset != 0
+  // suppresses the local display.
+  if (overrides.bootColorMode > 3) {
+    overrides.bootColorMode = (uint8_t)(esp_random() % 3);
+    overrides.bootColorR = 0;
+    overrides.bootColorG = 0;
+    overrides.bootColorB = 0;
+    configNeedsWrite = true;
+  }
+  btn.bootColorMode   = overrides.bootColorMode;
+  btn.bootColorRgb[0] = overrides.bootColorR;
+  btn.bootColorRgb[1] = overrides.bootColorG;
+  btn.bootColorRgb[2] = overrides.bootColorB;
+
+  // Boot effect: operator did NOT set a boot preset -> show the persisted
+  // boot color so it is visible that the device has booted.
   // When bootPreset != 0, WLED's standard path (beginStrip()/applyPreset)
   // runs unchanged and our display is suppressed.
   if (bootPreset == 0) {
-    showBootRandomColor();
+    applyBootColor();
+  }
+
+  // Headless Mode auto-resume: if the device was last running as Headless
+  // Master before the power-cycle, run the IDENTIFY_REPLY probe to verify
+  // no real Gateway has taken over in the meantime. Two simultaneously
+  // powered-on persisted-headless devices resolve cleanly via the jitter
+  // inside tryStartHeadless() — the first one to finish its probe claims
+  // master and answers the other's probe with OPC_SET_GROUP, demoting it.
+  if (overrides.headlessPersistedActive) {
+    tryStartHeadless();
   }
 }
 
@@ -207,12 +263,20 @@ void UsermodRaceLink::loop() {
   const uint32_t nowMs = millis();
   pollPhysicalButton(nowMs);
   serviceButtonFade(nowMs);
+  serviceBootColorSave(nowMs);
+  serviceHeadlessPersist(nowMs);
+  serviceHeadlessReassign(nowMs);
+  serviceSceneRebroadcast(nowMs);
+  serviceIndicator(nowMs);
 
   if (!radio) return;
 
   // replaces the previous flag-/ISR-/onRx() handling
   RaceLinkTransport::service(rl, cb);
   serviceStartupIdentifyReplies();
+  // Headless Mode probe state machine + keepalive. Cheap when neither
+  // probing nor active (early-return on the first cycle).
+  serviceHeadless(nowMs);
   // Offset-mode: fire any deferred apply whose deadline has elapsed.
   // Cheap when nothing is queued (single bool check).
   serviceDeferredApply();
@@ -485,6 +549,36 @@ void UsermodRaceLink::addToConfig(JsonObject& root) {
   ov[F("Segment 0 Stop LED")]       = overrides.seg0Stop;
   ov[F("Segment 1 Start LED")]      = overrides.seg1Start;
   ov[F("Segment 1 Stop LED")]       = overrides.seg1Stop;
+
+  // Headless Mode runtime persistence (no WebUI rows — set via 5-click
+  // gesture or via OPC_CONFIG in a future revision). Round-trips through
+  // cfg.json so a power-cycle resumes Headless Master ownership.
+  ov[F("Headless Active")]          = overrides.headlessPersistedActive;
+  ov[F("Headless Group Counter")]   = overrides.headlessGroupCounter;
+  ov[F("Headless Current Scene")]   = overrides.headlessCurrentScene;
+  ov[F("Headless Broadcast Bri")]   = overrides.headlessBroadcastBri;
+
+  // Persistent boot color identifier (per-device). See OverrideValues for the
+  // mode encoding; R/G/B are only meaningful when mode == 3.
+  ov[F("Boot Color Mode")]          = overrides.bootColorMode;
+  ov[F("Boot Color R")]             = overrides.bootColorR;
+  ov[F("Boot Color G")]             = overrides.bootColorG;
+  ov[F("Boot Color B")]             = overrides.bootColorB;
+
+  // Persistent Headless-master slave registry. Survives reboot/akku-swap so a
+  // master that loses power mid-event can re-bind its slaves on resume.
+  // Cleared by exitHeadlessMode().
+  JsonArray slaves = ov.createNestedArray(F("Headless Slaves"));
+  char hex[8];
+  for (uint8_t i = 0; i < headlessSlavesCount; i++) {
+    JsonObject o = slaves.createNestedObject();
+    snprintf(hex, sizeof(hex), "%02X%02X%02X",
+             headlessSlaves[i].addr3[0],
+             headlessSlaves[i].addr3[1],
+             headlessSlaves[i].addr3[2]);
+    o[F("a")] = String(hex);
+    o[F("g")] = headlessSlaves[i].groupId;
+  }
 }
 
 bool UsermodRaceLink::readFromConfig(JsonObject& root) {
@@ -606,6 +700,40 @@ bool UsermodRaceLink::readFromConfig(JsonObject& root) {
   getJsonValue(ov[F("Segment 1 Start LED")], overrides.seg1Start, (uint16_t)RACELINK_DEFAULT_SEG1_START);
   getJsonValue(ov[F("Segment 1 Stop LED")],  overrides.seg1Stop,  (uint16_t)RACELINK_DEFAULT_SEG1_STOP);
 
+  getJsonValue(ov[F("Headless Active")],         overrides.headlessPersistedActive, false);
+  getJsonValue(ov[F("Headless Group Counter")],  overrides.headlessGroupCounter,    (uint8_t)0);
+  getJsonValue(ov[F("Headless Current Scene")],  overrides.headlessCurrentScene,    (uint8_t)0xFF);
+  getJsonValue(ov[F("Headless Broadcast Bri")],  overrides.headlessBroadcastBri,    (uint8_t)128);
+
+  // Default 0xFF on missing key signals "first ever boot" to setup(), which
+  // then rolls esp_random() % 3 and forces a re-save.
+  getJsonValue(ov[F("Boot Color Mode")], overrides.bootColorMode, (uint8_t)0xFF);
+  getJsonValue(ov[F("Boot Color R")],    overrides.bootColorR,    (uint8_t)0);
+  getJsonValue(ov[F("Boot Color G")],    overrides.bootColorG,    (uint8_t)0);
+  getJsonValue(ov[F("Boot Color B")],    overrides.bootColorB,    (uint8_t)0);
+
+  // Headless slave registry — wipe runtime first so a config reload after a
+  // shrink (e.g. WebUI edit removing entries) does not leak stale records.
+  // Entries are silently skipped on malformed strings or groupId==0.
+  RaceLinkHeadless::clearSlaveTable(headlessSlaves, headlessSlavesCount,
+                                    RaceLinkHeadless::HEADLESS_MAX_SLAVES);
+  JsonArray slaves = ov[F("Headless Slaves")];
+  if (!slaves.isNull()) {
+    for (JsonObject o : slaves) {
+      if (headlessSlavesCount >= RaceLinkHeadless::HEADLESS_MAX_SLAVES) break;
+      String a = o[F("a")] | "";
+      uint8_t g = o[F("g")] | 0;
+      if (a.length() != 6 || g == 0) continue;
+      uint32_t val = strtoul(a.c_str(), nullptr, 16);
+      auto& rec = headlessSlaves[headlessSlavesCount];
+      rec.addr3[0] = (val >> 16) & 0xFF;
+      rec.addr3[1] = (val >> 8)  & 0xFF;
+      rec.addr3[2] = (val)       & 0xFF;
+      rec.groupId  = g;
+      headlessSlavesCount++;
+    }
+  }
+
   // WebUI Save path: push the new override values into live WLED globals
   // immediately so a Save is observable without a reboot. Boot path skips
   // this — setup() runs applyRaceLinkDefaults() right after WLED's deserialise
@@ -692,17 +820,43 @@ bool UsermodRaceLink::radioInit() {
   
   radio = &r;
 
+  // ---- RF config bring-up (NVS-backed, runtime-tunable since Stage 1 PR-3)
+  //
+  // Boot-loop recovery: tick the counter BEFORE radio.begin(). If
+  // we've hit BOOT_COUNTER_MAX strikes the persisted slot is presumed
+  // to be bricking the node (e.g. SF too high for the environment, or
+  // a freq the master can no longer reach). Wipe the slot now; the
+  // next load() returns false and we fall through to compile
+  // defaults below.
+  const uint8_t bootStrikes = RfConfigNvs::bootCounterIncrement();
+  if (bootStrikes > RfConfigNvs::BOOT_COUNTER_MAX) {
+    RfConfigNvs::wipe();
+  }
+
+  // Load the active config. Order of preference:
+  //   1) Validated NVS slot (operator-set via OPC_RF_CONFIG, survives
+  //      reboots).
+  //   2) Compile-time defaults (RACELINK_FREQ_HZ etc.). On first boot
+  //      we additionally persist these defaults so OPC_GET_RF_CONFIG
+  //      always returns a complete picture and so the operator can
+  //      pivot via a normal SET without first probing for "is anything
+  //      there yet".
+  if (!RfConfigNvs::load(g_activeRfConfig)) {
+    g_activeRfConfig = getCompileDefaultRfConfig();
+    RfConfigNvs::store(g_activeRfConfig);
+  }
+
   RaceLinkTransport::PhyCfg phy;
-  phy.freqMHz   = (float)(RACELINK_FREQ_HZ/1e6f);
-  phy.bwKHz     = RACELINK_BW_KHZ;
-  phy.sf        = RACELINK_SF;
-  phy.crDen     = RACELINK_CR;
-  phy.syncWord  = RACELINK_SYNC_WORD;
-  phy.preamble  = RACELINK_PREAMBLE;
+  phy.freqMHz   = (float)g_activeRfConfig.freq_hz / 1e6f;
+  phy.bwKHz     = (float)g_activeRfConfig.bw_khz_x10 / 10.0f;
+  phy.sf        = g_activeRfConfig.sf;
+  phy.crDen     = g_activeRfConfig.cr_den;
+  phy.syncWord  = g_activeRfConfig.sync_word;
+  phy.preamble  = g_activeRfConfig.preamble;
   phy.crcOn     = true;
 
   // C3 / HT-CT62 specific:
-  phy.txPowerDbm   = RACELINK_TX_POWER;        // override default
+  phy.txPowerDbm   = g_activeRfConfig.tx_power_dbm;
   phy.dio2RfSwitch = 1;                    // SX1262 (HT-CT62) or also LLCC68 (DreamLNK)
   phy.rxBoost      = -1;                   // or 1/0 depending on board tests
 
@@ -712,10 +866,16 @@ bool UsermodRaceLink::radioInit() {
   //rl.radio = radio;
 
   rl.lbtEnable = true;   // default: false
-  
+
   RaceLinkTransport::attachDio1(*radio, rl);
 
   RaceLinkTransport::setDefaultRxContinuous(rl); // *** IMPORTANT: enable continuous RX via RL ***
+
+  // Radio came up cleanly -- reset the strike counter so the next
+  // clean boot starts at zero. A hang inside beginCommon() above
+  // would leave the counter ticked, and the next boot (after the
+  // operator power-cycles) re-enters the recovery branch.
+  RfConfigNvs::bootCounterClear();
 
   return true;
 }
@@ -899,22 +1059,45 @@ void UsermodRaceLink::showPairConfirmedEffect() {
   stateUpdated(CALL_MODE_DIRECT_CHANGE);
 }
 
-void UsermodRaceLink::showBootRandomColor() {
-  // Solid with a random color from {R, G, B}. Only kicks in if the operator
-  // did NOT set a boot preset (bootPreset == 0). Serves as a visual
-  // "device has booted" signal.
-  // esp_random() is the ESP32's hardware RNG (no seed needed).
+void UsermodRaceLink::applyBootColor() {
+  // Solid with the persisted boot color. Mode 0/1/2 paints a primary via
+  // applyCycleColor(); mode 3 reuses the stored RGB triple verbatim so a
+  // random cycle position survives reboot exactly. Called at boot (when
+  // bootPreset == 0) and from the SCENE_RESTORE_BOOT_COLOR handler — both
+  // need to land on the same visual without re-rolling.
   if (bri == 0) bri = briS ? briS : 128;
-  uint8_t pick = (uint8_t)(esp_random() % 3);
-  applyCycleColor(pick);
-  // Seed the ring-buffer cycle: boot already shows one primary color (count=1),
-  // the next click jumps to (pick+1) % 3. That guarantees all three primary
-  // colors have been cycled through after boot+2 clicks before switching to
-  // random — regardless of which color boot picked.
-  btn.primariesShownCount = 1;
-  btn.nextPrimaryIdx      = (uint8_t)((pick + 1) % 3);
-  // lastColorClickMs stays 0: if the operator does not click for >RESET_MS,
-  // the idle reset kicks in and re-seeds the cycle with a new random start.
+
+  if (btn.bootColorMode < 3) {
+    // applyCycleColor mirrors mode + RGB back into btn.*; for the primary
+    // case that's a no-op rewrite. It also drives the segment + stateUpdated
+    // so we don't have to duplicate that here.
+    applyCycleColor(btn.bootColorMode);
+    // Seed the ring-buffer cycle: boot already shows one primary, the next
+    // click jumps to (mode+1) % 3. Guarantees all three primaries reachable
+    // within two more clicks before switching to random.
+    btn.primariesShownCount = 1;
+    btn.nextPrimaryIdx      = (uint8_t)((btn.bootColorMode + 1) % 3);
+  } else {
+    // Mode 3: paint the stored RGB directly. Cannot go through applyCycleColor
+    // (idx>=3 would re-roll a fresh random there).
+    colPri[0] = btn.bootColorRgb[0];
+    colPri[1] = btn.bootColorRgb[1];
+    colPri[2] = btn.bootColorRgb[2];
+    colPri[3] = 0;
+    Segment& seg = strip.getMainSegment();
+    seg.setMode(FX_MODE_STATIC);
+    seg.setColor(0, RGBW32(colPri[0], colPri[1], colPri[2], 0));
+    stateChanged = true;
+    stateUpdated(CALL_MODE_DIRECT_CHANGE);
+    // Cycle is "full" — next click triggers the idle-reset re-seed path in
+    // applyColorCycleStep (provided RACELINK_BTN_COLOR_RESET_MS has elapsed).
+    btn.primariesShownCount = 3;
+    btn.nextPrimaryIdx      = 0;
+  }
+  // applyBootColor is NOT an operator action — do not arm bootColorSavePending.
+  // applyCycleColor sets the runtime mirror but the persisted value is already
+  // in sync (we just read it).
+  btn.bootColorSavePending = false;
 }
 
 // ========= Single-click color cycle =========
@@ -929,11 +1112,24 @@ void UsermodRaceLink::applyCycleColor(uint8_t idx) {
   seg.setMode(FX_MODE_STATIC);
   seg.setColor(0, RGBW32(colPri[0], colPri[1], colPri[2], 0));
 
+  // Mirror the just-painted color into the boot-color runtime state so that
+  // serviceBootColorSave() can persist whatever the operator is currently
+  // looking at. Primary picks collapse to mode 0/1/2; any random pick lands
+  // on mode 3 with the actual RGB captured verbatim.
+  btn.bootColorMode   = (idx < 3) ? idx : 3;
+  btn.bootColorRgb[0] = colPri[0];
+  btn.bootColorRgb[1] = colPri[1];
+  btn.bootColorRgb[2] = colPri[2];
+
   stateChanged = true;
   stateUpdated(CALL_MODE_DIRECT_CHANGE);
 }
 
 void UsermodRaceLink::applyColorCycleStep(uint32_t now) {
+  // User clicked on a slave with no master talking — they're driving the
+  // local color cycle, so any pending indicator overlay should yield to
+  // the click instead of restoring underneath it later.
+  cancelIndicator();
   // Idle reset: after >RESET_MS without a single click, the cycle is re-seeded
   // with a new random start index from {0,1,2}. count=0 means "no primary
   // color shown yet in this cycle round" — so the next three clicks deliver
@@ -955,8 +1151,30 @@ void UsermodRaceLink::applyColorCycleStep(uint32_t now) {
   }
 
   btn.lastColorClickMs = now;
+  // Operator just changed the color — arm the deferred save. serviceBootColorSave()
+  // will fire it once the click-burst has been quiet for RACELINK_BTN_COLOR_RESET_MS,
+  // giving the operator a window to keep clicking without an interim flash-write.
+  btn.bootColorSavePending = true;
   stateChanged = true;
   colorUpdated(CALL_MODE_BUTTON);
+}
+
+void UsermodRaceLink::serviceBootColorSave(uint32_t now) {
+  // Edge-trigger: armed by applyColorCycleStep(), cleared here after the
+  // post-click idle window elapses. lastColorClickMs == 0 means "no click in
+  // this session yet" — applyBootColor() resets the pending flag at boot, so
+  // hitting this branch would mean something armed without setting the
+  // timestamp; skip rather than write stale state.
+  if (!btn.bootColorSavePending) return;
+  if (btn.lastColorClickMs == 0) return;
+  if ((now - btn.lastColorClickMs) <= RACELINK_BTN_COLOR_RESET_MS) return;
+
+  overrides.bootColorMode = btn.bootColorMode;
+  overrides.bootColorR    = btn.bootColorRgb[0];
+  overrides.bootColorG    = btn.bootColorRgb[1];
+  overrides.bootColorB    = btn.bootColorRgb[2];
+  configNeedsWrite        = true;
+  btn.bootColorSavePending = false;
 }
 
 // ========= Master-contact gate =========
@@ -969,6 +1187,15 @@ bool UsermodRaceLink::masterContactedRecently() const {
 void UsermodRaceLink::noteMasterRx() {
   lastMasterRxMs = millis();
   anyMasterRxSinceBoot = true;
+  // Headless promotion safety: ANY accepted master-side packet (or pairing
+  // event) during our probe window proves a master is alive on this channel.
+  // Refuse the promotion — the operator gets a red blink from
+  // serviceHeadless() on its next tick. Covers both the explicit
+  // OPC_SET_GROUP response and incidental traffic from a Gateway already
+  // running other slaves.
+  if (headless.probing) {
+    headless.probeAborted = true;
+  }
 }
 
 // ========= Custom button (GPIO 0) =========
@@ -1025,6 +1252,22 @@ void UsermodRaceLink::handleRaceLinkButton(uint8_t /*b*/, bool pressed, uint32_t
       // clients see the final bri value.
       btn.longHandled = false;
       stateUpdated(CALL_MODE_BUTTON);
+
+      // Headless: broadcast the final brightness exactly once on release.
+      // Avoids flooding the LoRa channel with per-tick updates and lets
+      // the operator dial in min/max comfortably with no mid-fade visual
+      // drift on the slaves — the fleet snaps to the final value when
+      // the operator releases the button.
+      if (headless.active && rl.macReadOK) {
+        uint8_t out[16];
+        uint8_t n = RaceLinkHeadless::buildBrightnessPacket(out, rl.myLast3, bri);
+        // armBlip=false: brightness broadcast is routine traffic, not pairing.
+        if (n) headlessSendTx(out, n, /*armBlip=*/false);
+        overrides.headlessBroadcastBri = bri;
+        headless.broadcastBri          = bri;
+        headless.lastBroadcastAtMs     = now;
+        configNeedsWrite = true;  // persist final brightness across reboot
+      }
       return;
     }
 
@@ -1042,36 +1285,71 @@ void UsermodRaceLink::handleRaceLinkButton(uint8_t /*b*/, bool pressed, uint32_t
       uint8_t clicks = btn.pendingShortClicks;
       btn.pendingShortClicks = 0;
 
-      if (clicks >= 3) {
-        // Hotspot — ALWAYS, independent of the master-quiet-gate (recovery path).
+      // Click-count dispatch. Order matters: 5-click is the headless
+      // toggle and must beat the AP recovery branch. 4-click and 6+-click
+      // are explicit typo guards — a slipped 4-tap or an over-shot 6-tap
+      // must NOT accidentally open the AP. AP recovery is bound to
+      // exactly 3 clicks (was clicks >= 3, which made 6-click open the AP
+      // instead of toggling headless — confused operators field-testing
+      // the 5-click toggle).
+      if (clicks == 5) {
+        tryStartHeadless();
+        return;
+      }
+      if (clicks == 4 || clicks >= 6) {
+        // Typo guard — no action.
+        return;
+      }
+      if (clicks == 3) {
+        // Hotspot recovery — ALWAYS, independent of the master-quiet-gate.
         WLED::instance().initAP(true);
         return;
       }
-      if (clicks == 1 && !masterContactedRecently()) {
-        // Cycle color through R -> G -> B -> random cycle. Idle reset (>10s
-        // since last click) falls back to R.
-        applyColorCycleStep(now);
-      }
       // clicks == 2 -> intentionally no action (reserved for future use).
+      if (clicks == 1) {
+        if (headless.active) {
+          // Headless Master: single-click advances the broadcast scene.
+          // No master-quiet gate — this device IS the master.
+          headlessAdvanceScene();
+        } else if (!masterContactedRecently()) {
+          // Cycle color through R -> G -> B -> random cycle. Idle reset (>10s
+          // since last click) falls back to R.
+          applyColorCycleStep(now);
+        }
+      }
     }
   }
 }
 
 void UsermodRaceLink::serviceButtonFade(uint32_t now) {
   if (!btn.down || !btn.longHandled) return;
-  if (masterContactedRecently()) return; // lock out if the master speaks during a hold
+  // Master-quiet gate: lock out if the paired master speaks during a hold.
+  // The headless master clears masterKnown on entry (see enterHeadlessMode),
+  // so masterContactedRecently() stays false for its entire session — no
+  // extra headless-specific qualifier needed here.
+  if (masterContactedRecently()) return;
   if ((now - btn.lastFadeTickMs) < RACELINK_BTN_FADE_TICK_MS) return;
 
   btn.lastFadeTickMs = now;
+
+  // Non-linear step ("S-curve"): smaller deltas near the limits so the
+  // operator can dial in min/max comfortably, larger deltas in the middle
+  // so a full sweep still completes in a usable ~4 s. Total ticks =
+  // 32×1 + 32×2 + 32×1 + 32×2 + 32×1 ≈ 128 × 30 ms ≈ 3.8 s for a full
+  // 0→255→0 ping-pong leg. Tunable by editing the band breakpoints below.
+  uint8_t briStep;
+  if      (bri < 32 || bri > 223)   briStep = 1;
+  else if (bri < 64 || bri > 191)   briStep = 2;
+  else                              briStep = 4;
 
   // Ping-pong: invert direction at the limits so the fade keeps running
   // continuously as long as the button is held.
   int next = (int)bri;
   if (btn.briDirUp) {
-    next += RACELINK_BTN_BRI_STEP;
+    next += briStep;
     if (next >= 255) { next = 255; btn.briDirUp = false; }
   } else {
-    next -= RACELINK_BTN_BRI_STEP;
+    next -= briStep;
     if (next <= 1)   { next = 1;   btn.briDirUp = true; } // not fully off -> avoid offMode
   }
   if ((uint8_t)next == bri) return;
@@ -1081,6 +1359,11 @@ void UsermodRaceLink::serviceButtonFade(uint32_t now) {
   // bri + applyBri + strip.trigger). Without this, the transition keeps running
   // for transitionDelay ms after release and the fade feels extremely sluggish.
   applyFinalBri();
+
+  // No headless brightness broadcast here — the fade is local-only during
+  // the hold. Sending per-tick would flood the single-slot TX queue
+  // (~30 ms tick vs LBT backoff + ToA). The final value is broadcast once
+  // on button release; see handleRaceLinkButton's falling-edge block.
 }
 
 bool UsermodRaceLink::handleStreamPacket(const uint8_t* buf, uint8_t len, const uint8_t senderLast3[3]) {
@@ -1143,14 +1426,88 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
   Header7 h{};
   if (!parseHeader(buf, (uint8_t)len, h)) return;
   debugCounter=1;
-  if (!RaceLinkTransport::receiverMatches(h.receiver, rl.myLast3)) return;  // broadcast OR exactly my 3B
+  // DIAGNOSTIC (Headless re-bind investigation 2026-05-18): one compact line
+  // per RX-after-header-parse showing addressing + raw type. Remove once the
+  // re-bind investigation is closed.
+  DEBUG_PRINTF_P(PSTR("[RaceLink] RX hdr sender=%02X%02X%02X recv=%02X%02X%02X type=0x%02X len=%u\n"),
+                 h.sender[0], h.sender[1], h.sender[2],
+                 h.receiver[0], h.receiver[1], h.receiver[2],
+                 (unsigned)h.type, (unsigned)len);
+  if (!RaceLinkTransport::receiverMatches(h.receiver, rl.myLast3)) {
+    DEBUG_PRINTLN(F("[RaceLink] RX -> receiverMatches REJECT"));
+    return;  // broadcast OR exactly my 3B
+  }
   debugCounter=2;
-  if (type_dir(h.type) != DIR_M2N) return;                       // only Master->Node requests here
+
+  // Headless Master: accept the otherwise-rejected N2M IDENTIFY_REPLY
+  // broadcasts so we can auto-pair arriving nodes. Runs BEFORE the DIR_M2N
+  // filter (a slave would normally drop N2M packets). The headless master
+  // is the only node that needs to listen for them.
+  if (headless.active && type_dir(h.type) == DIR_N2M
+      && type_base(h.type) == OPC_DEVICES) {
+    P_IdentifyReply ir{};
+    if (parseBody(buf, (uint8_t)len, ir)) {
+      headlessAssignGroupTo(h.sender, ir.groupId);
+      rxAccepted++;
+    }
+    return;
+  }
+
+  // Headless Master: also accept N2M OPC_ACK so the re-bind sweep is
+  // observable. Slaves respond with OPC_ACK after applying an OPC_SET_GROUP;
+  // without this branch the ACK falls through the DIR_M2N filter (slaves'
+  // default drop) and we have no operator-visible confirmation that the
+  // pairing landed. Logged-only — no visual indicator by user choice.
+  if (headless.active && type_dir(h.type) == DIR_N2M
+      && type_base(h.type) == OPC_ACK) {
+    P_Ack ack{};
+    if (parseBody(buf, (uint8_t)len, ack)) {
+      DEBUG_PRINTF_P(PSTR("[RaceLink] Headless: RX ACK from %02X%02X%02X echoOpcode=0x%02X status=%u\n"),
+                     h.sender[0], h.sender[1], h.sender[2],
+                     (unsigned)ack.echo_opcode7, (unsigned)ack.status);
+      rxAccepted++;
+    }
+    return;
+  }
+
+  // Master-alive detector: any M2N packet that survives the receiverMatches
+  // gate and was NOT sent by us proves a master is talking on the channel.
+  // Runs BEFORE senderAllowed so we catch packets regardless of the local
+  // MAC-filter state — e.g. a Gateway's periodic OPC_SYNC autosync that
+  // would otherwise be dropped because masterKnown is false after a
+  // power-cycle. The user-stated principle is "a real Gateway always wins
+  // over headless mode", so:
+  //   probing -> mark probeAborted; serviceHeadless red-blinks and refuses
+  //              promotion on its next tick.
+  //   active  -> step down immediately. Re-arming headless is a deliberate
+  //              5-click away once the gateway is gone.
+  // We never react to our own broadcasts (we don't receive them on the
+  // radio anyway, but the same3-against-self check is defensive). Normal
+  // dispatch continues below so e.g. an OPC_SET_GROUP can still finish the
+  // re-pair on the same packet.
+  if (type_dir(h.type) == DIR_M2N
+      && !RaceLinkTransport::same3(h.sender, rl.myLast3)) {
+    if (headless.probing) {
+      headless.probeAborted = true;
+    } else if (headless.active) {
+      exitHeadlessMode();
+    }
+  }
+
+  if (type_dir(h.type) != DIR_M2N) {
+    DEBUG_PRINTLN(F("[RaceLink] RX -> direction REJECT (not DIR_M2N)"));
+    return;                       // only Master->Node requests here
+  }
   debugCounter=3;
   const uint8_t opcode7 = type_base(h.type);
 
   // MAC filter (optional, as before)
-  if (!senderAllowed(h.sender, opcode7)) return;
+  if (!senderAllowed(h.sender, opcode7)) {
+    DEBUG_PRINTF_P(PSTR("[RaceLink] RX -> senderAllowed REJECT opcode=0x%02X macFilterEnabled=%u masterKnown=%u stored=%02X%02X%02X\n"),
+                   (unsigned)opcode7, (unsigned)macFilterEnabled, (unsigned)masterKnown,
+                   masterLast3[0], masterLast3[1], masterLast3[2]);
+    return;
+  }
   debugCounter=4;
 
   // Master quiet gate: every accepted packet from the already-paired master
@@ -1185,16 +1542,40 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
     } break;
 
     case OPC_SET_GROUP: { // SET_GROUP -> apply + ACK
+      // DIAGNOSTIC (Headless re-bind investigation 2026-05-18): every
+      // SET_GROUP that survives sender/receiver/direction gates lands here.
+      // Remove once the re-bind issue is closed.
+      DEBUG_PRINTF_P(PSTR("[RaceLink] RX OPC_SET_GROUP sender=%02X%02X%02X recv=%02X%02X%02X len=%u\n"),
+                     h.sender[0], h.sender[1], h.sender[2],
+                     h.receiver[0], h.receiver[1], h.receiver[2], (unsigned)len);
       P_SetGroup p{};
-      if (!parseBody(buf, (uint8_t)len, p)) break;
+      if (!parseBody(buf, (uint8_t)len, p)) {
+        DEBUG_PRINTLN(F("[RaceLink] RX OPC_SET_GROUP -> parseBody REJECT (length mismatch)"));
+        break;
+      }
+      DEBUG_PRINTF_P(PSTR("[RaceLink] RX OPC_SET_GROUP body groupId=%u (was=%u) headless.active=%u\n"),
+                     (unsigned)p.groupId, (unsigned)current.groupId, (unsigned)headless.active);
+
+      // Headless takeover by a real Gateway: a foreign master is claiming
+      // us, so step down from Headless Master and accept the new pairing
+      // like any other slave. ``exitHeadlessMode`` clears the persisted-
+      // active flag so we will not re-promote at the next reboot — the
+      // operator can re-enable headless via 5-click whenever desired.
+      // (probeAborted for the probing case is set in noteMasterRx().)
+      if (headless.active) {
+        exitHeadlessMode();
+      }
 
       // as before: group 0 allows setting / or "255" special-case logic...
       current.groupId = p.groupId;
 
       learnMasterFromSender(h.sender, /*persistIfEnabled*/true);
 
-      // visual feedback (direct effect call; no preset slot reserved anymore)
-      showPairConfirmedEffect();
+      // Visual feedback via the central indicator system: 3-second white
+      // breathe overlay, then auto-restore to whatever was on the strip
+      // before (boot-random for fresh slaves, last scene for re-pair).
+      // Replaces the previous persistent showPairConfirmedEffect() call.
+      applyLocalIndicator(RaceLinkIndicators::IND_PAIR_CONFIRMED, 5);
 
       sendAckTo(h.sender, OPC_SET_GROUP, ACK_OK);
       acted = true;
@@ -1479,6 +1860,103 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
     case OPC_STREAM: {
       acted = handleStreamPacket(buf, (uint8_t)len, h.sender);
     } break;
+
+    case OPC_HEADLESS: { // Headless Mode broadcast (2B body)
+      P_Headless p{};
+      if (!parseBody(buf, (uint8_t)len, p)) break;
+      applyLocalScene(p.sceneId, p.brightness);
+      acted = true;
+      DEBUG_PRINTF_P(PSTR("[RaceLink] HEADLESS -> sceneId=%u bri=%u\n"),
+                     (unsigned)p.sceneId, (unsigned)p.brightness);
+    } break;
+
+    case OPC_INDICATE: { // Central status-indicator overlay (2B body)
+      P_Indicate p{};
+      if (!parseBody(buf, (uint8_t)len, p)) break;
+      applyLocalIndicator(p.type, p.durationSec);
+      acted = true;
+      DEBUG_PRINTF_P(PSTR("[RaceLink] INDICATE -> type=%u dur=%us\n"),
+                     (unsigned)p.type, (unsigned)p.durationSec);
+    } break;
+
+    case OPC_RF_CONFIG: { // Write LoRa PHY config (12 B P_RfConfig)
+      // Unicast-only by design: a broadcast OPC_RF_CONFIG would knock
+      // every reachable node off-channel simultaneously and brick the
+      // fleet. The wire-level rule lives in racelink_proto.h; we
+      // enforce it again here so a future broadcast-permitting rules
+      // table change doesn't silently brick anyone.
+      if (RaceLinkTransport::isBroadcast3(h.receiver)) {
+        DEBUG_PRINTLN(F("[RaceLink] RF_CONFIG -> broadcast rejected"));
+        break;
+      }
+      P_RfConfig p{};
+      if (!parseBody(buf, (uint8_t)len, p)) break;
+
+      // Range validation: out-of-band freq, unsupported BW / SF / CR /
+      // TX power / preamble all NACK with ACK_BAD_LEN. We could carry
+      // a richer reason via P_Ack.status, but the host already
+      // distinguishes "rejected by node" (any non-OK ACK) from
+      // "node unreachable" (no ACK at all), so the existing status
+      // space is sufficient.
+      const auto reason = RfConfigNvs::validate(p);
+      if (reason != RaceLinkProto::RF_CHANGE_OK) {
+        sendAckTo(h.sender, OPC_RF_CONFIG, ACK_BAD_LEN);
+        DEBUG_PRINTF_P(PSTR("[RaceLink] RF_CONFIG -> NACK reason=%u\n"),
+                       (unsigned)reason);
+        acted = true;
+        break;
+      }
+
+      // Persist before ACK so a tight-timed reboot can't drop the
+      // write. store() defensively re-validates; we treat any non-OK
+      // result here as NVS failure (the only remaining failure mode).
+      if (RfConfigNvs::store(p) != RaceLinkProto::RF_CHANGE_OK) {
+        sendAckTo(h.sender, OPC_RF_CONFIG, ACK_ERROR);
+        DEBUG_PRINTLN(F("[RaceLink] RF_CONFIG -> NVS write failed"));
+        acted = true;
+        break;
+      }
+
+      // Update the in-RAM mirror so a same-boot OPC_GET_RF_CONFIG read
+      // before reboot reflects the freshly persisted values.
+      g_activeRfConfig = p;
+
+      sendAckTo(h.sender, OPC_RF_CONFIG, ACK_OK);
+      acted = true;
+      DEBUG_PRINTF_P(PSTR("[RaceLink] RF_CONFIG -> stored, rebooting (freq=%lu sf=%u bw=%u sw=0x%02X)\n"),
+                     (unsigned long)p.freq_hz, (unsigned)p.sf,
+                     (unsigned)p.bw_khz_x10, (unsigned)p.sync_word);
+
+      // Apply the new PHY by rebooting -- radioInit() in setup() will
+      // reload NVS on the way back up. RadioLib has no clean "reset
+      // PHY mid-flight" path on a node that may be in the middle of a
+      // streaming RX, and a node-side reboot is operator-visible (a
+      // brief outage on a single device) rather than fleet-wide. The
+      // 50 ms delay lets the ACK frame finish leaving the radio
+      // before the SoC restarts.
+      delay(50);
+      ESP.restart();
+      // not reached
+    } break;
+
+    case OPC_GET_RF_CONFIG: { // Read-back of the active PHY config
+      if (RaceLinkTransport::isBroadcast3(h.receiver)) {
+        // Unicast-only: a broadcast read-back would have every node
+        // reply simultaneously and saturate the channel.
+        break;
+      }
+      P_GetRfConfig p{};
+      if (!parseBody(buf, (uint8_t)len, p)) break;
+      if (p.reserved != 0) {
+        // Reserved must be 0 today (future channel-slot selector).
+        // Non-zero is a structurally invalid request -- no reply,
+        // matching how OPC_GET_CONFIG handles unknown options.
+        break;
+      }
+      sendRfConfigReplyTo(h.sender);
+      acted = true;
+      DEBUG_PRINTLN(F("[RaceLink] GET_RF_CONFIG -> reply sent"));
+    } break;
   }
 
   if (acted) rxAccepted++;
@@ -1615,6 +2093,23 @@ void UsermodRaceLink::sendGetConfigReplyTo(const uint8_t destLast3[3], uint8_t o
   RaceLinkTransport::scheduleSend(rl, out, n);
 }
 
+void UsermodRaceLink::sendRfConfigReplyTo(const uint8_t destLast3[3]) {
+  // GET_RF_CONFIG_REPLY: same opcode as the request with the N2M
+  // direction bit and a P_RfConfig-shaped body (12 B). Reuses the
+  // standard build() helper so the byte layout matches the
+  // OPC_RF_CONFIG write frame on the wire. Returns the in-RAM
+  // g_activeRfConfig, which mirrors the persisted NVS slot 1:1 after
+  // radioInit() (and equals the freshly-persisted value during the
+  // tiny window between an OPC_RF_CONFIG ACK and the ESP.restart()).
+  using namespace RaceLinkProto;
+  uint8_t out[32];
+
+  uint8_t t = make_type(DIR_N2M, OPC_GET_RF_CONFIG);
+  uint8_t n = build(out, rl.myLast3, destLast3, t, g_activeRfConfig);
+
+  RaceLinkTransport::scheduleSend(rl, out, n);
+}
+
 // ========= PRESET handler (always immediate) =========
 // Most of p.flags is IGNORED here — control flags are processed only by
 // OPC_CONTROL (single-writer rule). PRESET cannot be armed and cannot drive
@@ -1625,6 +2120,8 @@ void UsermodRaceLink::sendGetConfigReplyTo(const uint8_t destLast3[3], uint8_t o
 // per-device phase offset onto strip.timebase.
 void UsermodRaceLink::handlePreset(const RaceLinkProto::P_Preset& p) {
   haveControl = true;
+  // PRESET is a new authoritative state — preempt any running indicator.
+  cancelIndicator();
 
   applyPreset(p.presetId, CALL_MODE_NO_NOTIFY);
   bri = p.brightness;
@@ -1761,6 +2258,8 @@ void UsermodRaceLink::applyAdvancedFields(uint8_t flags, const AdvancedFields& f
 void UsermodRaceLink::handleControl(uint8_t flags, const AdvancedFields& f) {
   haveControl = true;
   current.flags = flags;
+  // CONTROL is a new authoritative state — preempt any running indicator.
+  cancelIndicator();
 
   if (flags & RACELINK_FLAG_ARM_ON_SYNC) {
     pending.fields = f;
@@ -2181,6 +2680,673 @@ void UsermodRaceLink::on_rx_node(const uint8_t* pkt, uint8_t len,
     memset(myLast3, 0, 3);
   }
 } */
+
+// ===================== Headless Mode =====================
+// Wire-stable definitions live in racelink_headless.h so external Gateway-
+// side software (e.g. FPVGate) can ``#include`` it and emit the same
+// scene-id / packet bytes that the WLED Headless master uses.
+
+void UsermodRaceLink::tryStartHeadless() {
+  // Toggle off when already active. No probe needed — we know we're the
+  // master right now, so a "stop" is unambiguous.
+  if (headless.active) {
+    exitHeadlessMode();
+    return;
+  }
+  // Already in the probe window — silently ignore (a stuck 5-click is
+  // probably the user being impatient, not a request to re-probe).
+  if (headless.probing) return;
+  if (!radioReady || !rl.macReadOK) {
+    DEBUG_PRINTLN(F("[RaceLink] Headless: radio/MAC not ready, refusing probe"));
+    return;
+  }
+
+  // Pick the jittered first-send time. esp_random() is the hardware RNG
+  // so two simultaneously powered-on persisted-headless devices end up
+  // with distinct probe schedules.
+  const uint32_t now = millis();
+  const uint32_t range = RaceLinkHeadless::HEADLESS_PROBE_JITTER_MAX_MS
+                       - RaceLinkHeadless::HEADLESS_PROBE_JITTER_MIN_MS;
+  const uint32_t j = RaceLinkHeadless::HEADLESS_PROBE_JITTER_MIN_MS
+                   + (esp_random() % (range + 1));
+  headless.probing            = true;
+  headless.probeAborted       = false;
+  headless.probeFirstSent     = false;
+  headless.probeSecondSent    = false;
+  headless.probeFirstSendAtMs = now + j;
+  headless.probeSecondSendAtMs= now + j + RaceLinkHeadless::HEADLESS_PROBE_RETRY_OFFSET_MS;
+  headless.probeStartedAtMs   = 0; // set when the first probe actually goes out
+  DEBUG_PRINTF_P(PSTR("[RaceLink] Headless: probe scheduled (+%lu ms)\n"),
+                 (unsigned long)j);
+}
+
+void UsermodRaceLink::serviceHeadless(uint32_t now) {
+  if (!headless.probing && !headless.active) return;
+
+  if (headless.probing) {
+    // Abort path: noteMasterRx() set probeAborted because some master
+    // proved it is alive on the channel during our probe window.
+    if (headless.probeAborted) {
+      headless.probing = false;
+      headless.probeAborted = false;
+      // Indicator system drives the 3-second red-strobe overlay AND auto-
+      // restores the pre-probe segment state (typically the boot-random
+      // color) when the duration expires. Replaces the old btn.blink*
+      // state machine + manual applyCycleColor red/black toggle.
+      applyLocalIndicator(RaceLinkIndicators::IND_PROBE_REJECTED, 5);
+      DEBUG_PRINTLN(F("[RaceLink] Headless: probe rejected — master active"));
+      return;
+    }
+
+    // First scheduled probe send (start-of-window anchor).
+    if (!headless.probeFirstSent && (int32_t)(now - headless.probeFirstSendAtMs) >= 0) {
+      if (radioReady && rl.macReadOK) {
+        uint8_t out[32];
+        uint8_t n = RaceLinkHeadless::buildIdentifyProbe(
+            out, rl.myLast3, rl.myMac6, RaceLinkProto::PROTO_VER_MAJOR, DEV_TYPE);
+        // armBlip=false: probe runs while headless.active is still false anyway,
+        // and a TX flash during the "am I the master?" handshake would mislead
+        // the operator into thinking promotion already happened.
+        if (n) headlessSendTx(out, n, /*armBlip=*/false);
+      }
+      headless.probeFirstSent   = true;
+      headless.probeStartedAtMs = now;
+    }
+
+    // Second probe — single-loss coverage at SF7.
+    if (headless.probeFirstSent && !headless.probeSecondSent
+        && (int32_t)(now - headless.probeSecondSendAtMs) >= 0) {
+      if (radioReady && rl.macReadOK) {
+        uint8_t out[32];
+        uint8_t n = RaceLinkHeadless::buildIdentifyProbe(
+            out, rl.myLast3, rl.myMac6, RaceLinkProto::PROTO_VER_MAJOR, DEV_TYPE);
+        if (n) headlessSendTx(out, n, /*armBlip=*/false);
+      }
+      headless.probeSecondSent = true;
+    }
+
+    // Timeout: no abort fired within the probe window → promote.
+    if (headless.probeFirstSent
+        && (now - headless.probeStartedAtMs) >= RaceLinkHeadless::HEADLESS_PROBE_TIMEOUT_MS) {
+      enterHeadlessMode();
+    }
+    return;
+  }
+
+  // active: SYNC keepalive. 4B autosync (timebase + bri) every
+  // HEADLESS_SYNC_KEEPALIVE_MS so paired slaves' masterContactedRecently()
+  // stays true AND their strip.timebase stays anchored to the master
+  // clock — cyclic effects like Breathe then hold phase across the fleet.
+  // Scene state is NOT re-broadcast: a slave that joins mid-session is
+  // pair-confirmed via showPairConfirmedEffect and stays on its boot
+  // visual until the operator drives a new scene (1-click) — exactly the
+  // same UX a Gateway+Host pair produces.
+  if (headless.active) {
+    if ((now - headless.lastBroadcastAtMs) >= RaceLinkHeadless::HEADLESS_SYNC_KEEPALIVE_MS) {
+      headlessBroadcastSync(now);
+    }
+  }
+}
+
+void UsermodRaceLink::enterHeadlessMode() {
+  headless.active  = true;
+  headless.probing = false;
+  // Promoting to headless master is a deliberate role transition; any
+  // running indicator overlay should yield to the entry cue (solid blue)
+  // and the subsequent scene broadcast.
+  cancelIndicator();
+  // The master conceptually owns Group 1 (Group 0 is the unconfigured pool,
+  // slaves start at HEADLESS_FIRST_GROUP_ID = 2). Setting current.groupId
+  // explicitly here keeps the wire-level receiver filter coherent for any
+  // direct-to-1 packets and makes the role visible in /json/cfg.
+  current.groupId = RaceLinkHeadless::HEADLESS_MASTER_GROUP_ID;
+  if (!overrides.headlessPersistedActive) {
+    overrides.headlessPersistedActive = true;
+    configNeedsWrite = true;
+  }
+  // The headless master conceptually has no paired master. Zero the entire
+  // master-tracking state — that way noteMasterRx() can no longer fire
+  // (its handlePacket call site is gated by masterKnown && same3) and
+  // masterContactedRecently() stays definitionally false for the duration
+  // of headless operation. Cascades into a simpler serviceButtonFade gate
+  // and a cleaner senderAllowed filter (only OPC_DEVICES/OPC_SET_GROUP
+  // from foreign senders pass — exactly the right surface for "I am the
+  // master here"). On clean takeover the OPC_SET_GROUP handler rebinds
+  // masterLast3 via learnMasterFromSender.
+  clearMaster();
+  masterFull6Known     = false;
+  memset(masterFull6, 0, sizeof(masterFull6));
+  anyMasterRxSinceBoot = false;
+  lastMasterRxMs       = 0;
+  // Visual success cue: 3-second blue breathe via the central indicator
+  // system. If a persisted scene is restored right after (see below),
+  // headlessBroadcastCurrentScene -> applyLocalScene -> cancelIndicator
+  // preempts this overlay immediately and the operator sees the scene
+  // instead — matching the previous solid-blue behavior.
+  applyLocalIndicator(RaceLinkIndicators::IND_HEADLESS_ENTER, 5);
+  DEBUG_PRINTF_P(PSTR("[RaceLink] Headless: ACTIVE (counter=%u, scene=%u)\n"),
+                 (unsigned)overrides.headlessGroupCounter,
+                 (unsigned)overrides.headlessCurrentScene);
+  // Master self-sync before the first broadcast: applyLocalScene() (invoked
+  // from headlessBroadcastCurrentScene below) re-applies setActivePhaseOffsetMs
+  // delta-based against the existing strip.timebase. Without resetting the
+  // invariant first, perturbations accumulated since the last reboot persist
+  // through the new headless session. See headlessBroadcastSync() for the
+  // permanent per-keepalive re-anchor.
+  strip.timebase = (uint32_t)(-(int32_t)activePhaseOffsetMs);
+
+  bool sceneRestored = false;
+  if (overrides.headlessCurrentScene != 0xFF) {
+    // Resolve sceneId -> catalog index for the in-memory state.
+    headless.currentSceneIdx = 0xFF;
+    for (uint8_t i = 0; i < RaceLinkHeadless::SCENE_CATALOG_SIZE; ++i) {
+      if (RaceLinkHeadless::SCENE_CATALOG[i].sceneId == overrides.headlessCurrentScene) {
+        headless.currentSceneIdx = i;
+        break;
+      }
+    }
+    if (headless.currentSceneIdx != 0xFF) {
+      headless.broadcastBri = overrides.headlessBroadcastBri;
+      headlessBroadcastCurrentScene();
+      sceneRestored = true;
+    }
+  }
+
+  // Initial SYNC anchors slave timebases as soon as the master comes up.
+  // Skipped when we just broadcast a scene packet — back-to-back
+  // scheduleSend would lose the second one to the single-slot TX queue.
+  // In that case the first 30 s keepalive tick will fire the SYNC.
+  if (!sceneRestored) {
+    headlessBroadcastSync(millis());
+  }
+  // Proactive re-bind: every persisted slave gets a fresh SET_GROUP with
+  // its stored ID, staggered so the LoRa duty cycle stays sane and the
+  // single-slot TX queue does not drop packets. Slaves that did NOT
+  // power-cycle alongside the master (typical: battery-powered race lights
+  // staying on through a master swap) regain their pairing without having
+  // to re-emit IDENTIFY_REPLY themselves.
+  startHeadlessReassign();
+}
+
+void UsermodRaceLink::exitHeadlessMode() {
+  if (!headless.active && !overrides.headlessPersistedActive) return;
+  headless.active  = false;
+  headless.probing = false;
+  // Role transition out of headless — clear any indicator overlay so the
+  // boot-color exit cue below is what the operator sees.
+  cancelIndicator();
+  // Cancel any pending re-bind sweep so we don't keep paging slaves with a
+  // group we no longer own.
+  RaceLinkHeadless::abortReassign(headlessReassign);
+  // Deactivation is the operator signal to drop the whole pairing context.
+  // Counter, slave registry, and our own master groupId all reset so the
+  // next Headless promotion starts from a clean slate (Group 2 onward).
+  overrides.headlessGroupCounter = 0;
+  current.groupId                = 0;
+  RaceLinkHeadless::clearSlaveTable(headlessSlaves, headlessSlavesCount,
+                                    RaceLinkHeadless::HEADLESS_MAX_SLAVES);
+  // Force an immediate write (skip the pairing-burst debounce) — exit is
+  // rare and the operator expects "off means off" to survive a battery pull.
+  RaceLinkHeadless::persistConsumed(headlessPersist);
+  if (overrides.headlessPersistedActive) {
+    overrides.headlessPersistedActive = false;
+  }
+  configNeedsWrite = true;
+  // Visual confirmation via the central indicator system: 3-second
+  // magenta breathe overlay distinguishable from enter (blue) and
+  // probe-rejected (red). Fires for ALL exit paths (manual 5-click,
+  // runtime Gateway-takeover via the master-alive detector, OPC_SET_GROUP
+  // takeover). After expiry the indicator restores whatever scene the
+  // master was last showing — slaves are on that same scene, so the
+  // ex-master visually rejoins them.
+  applyLocalIndicator(RaceLinkIndicators::IND_HEADLESS_EXIT, 5);
+  DEBUG_PRINTLN(F("[RaceLink] Headless: INACTIVE"));
+}
+
+void UsermodRaceLink::headlessAdvanceScene() {
+  // Wrap from 0xFF (= none) to 0; otherwise step + wrap-around.
+  if (headless.currentSceneIdx >= RaceLinkHeadless::SCENE_CATALOG_SIZE) {
+    headless.currentSceneIdx = 0;
+  } else {
+    headless.currentSceneIdx = RaceLinkHeadless::nextSceneIdx(headless.currentSceneIdx);
+  }
+  const RaceLinkHeadless::HeadlessScene& s
+      = RaceLinkHeadless::SCENE_CATALOG[headless.currentSceneIdx];
+  overrides.headlessCurrentScene = s.sceneId;
+  configNeedsWrite = true;
+  headlessBroadcastCurrentScene();
+}
+
+void UsermodRaceLink::headlessBroadcastCurrentScene() {
+  using namespace RaceLinkProto;
+  if (!radioReady || !rl.macReadOK) return;
+  if (headless.currentSceneIdx >= RaceLinkHeadless::SCENE_CATALOG_SIZE) return;
+  const RaceLinkHeadless::HeadlessScene& s
+      = RaceLinkHeadless::SCENE_CATALOG[headless.currentSceneIdx];
+  const uint8_t bri8 = headless.broadcastBri ? headless.broadcastBri
+                                              : overrides.headlessBroadcastBri;
+
+  uint8_t out[32];
+
+  // Single OPC_HEADLESS broadcast — receivers expand it from their local
+  // catalog, including per-group phase offset for SCENE_FLAG_USE_OFFSET
+  // rows. We deliberately do NOT pre-emit an OPC_OFFSET here: the
+  // transport's single-slot TX queue would reject the second scheduleSend
+  // (LBT jitter + ToA easily exceeds the click->click gap), silently
+  // dropping the scene packet. The catalog row is the single source of
+  // truth on both ends, so empfängerseitiges Expand reicht.
+  uint8_t n = RaceLinkHeadless::buildHeadlessPacket(out, rl.myLast3, s.sceneId, bri8);
+  // armBlip=false: scene broadcast is routine traffic, not pairing.
+  if (n) headlessSendTx(out, n, /*armBlip=*/false);
+
+  // Apply locally so the headless master's own strip mirrors what it
+  // just told everyone else to do.
+  applyLocalScene(s.sceneId, bri8);
+
+  headless.lastBroadcastAtMs = millis();
+  DEBUG_PRINTF_P(PSTR("[RaceLink] Headless: broadcast scene %u (%s) bri=%u\n"),
+                 (unsigned)s.sceneId, s.label, (unsigned)bri8);
+}
+
+void UsermodRaceLink::headlessBroadcastSync(uint32_t now) {
+  using namespace RaceLinkProto;
+  if (!radioReady || !rl.macReadOK) return;
+
+  // 4B autosync form (no flags byte) — timebase-only, never fires armed
+  // effects. Mirrors the Gateway's idle-period autosync behavior so slaves
+  // can adjust strip.timebase against the master clock and keep their
+  // masterContactedRecently() gate closed without needing the heavier
+  // scene re-broadcast as a keepalive proxy.
+  static const uint8_t bcast[3] = { 0xFF, 0xFF, 0xFF };
+  uint8_t out[16];
+  uint8_t n = build_empty(out, rl.myLast3, bcast, make_type(DIR_M2N, OPC_SYNC));
+  const uint32_t ts24 = now & 0x00FFFFFFu;
+  out[n++] = (uint8_t)(ts24 & 0xFF);
+  out[n++] = (uint8_t)((ts24 >> 8) & 0xFF);
+  out[n++] = (uint8_t)((ts24 >> 16) & 0xFF);
+  out[n++] = bri;  // current brightness — handleSync uses it only when haveControl && !HAS_BRI
+
+  // SYNC bypasses LBT via scheduleSend's jitterMaxMs=0 universal-bypass
+  // branch (see racelink_transport_core.h scheduleSend doc). The precision
+  // of the ts24 timestamp dominates the slaves' drift-correction quality
+  // and the default LBT 50..300 ms random jitter between our millis()
+  // sample and the actual TX would inflate slaves' lastSyncTbErrMs from
+  // ~15 ms (Gateway baseline) to ~250 ms. SYNC is broadcast-only and
+  // low-frequency (30 s keepalive + on-demand), so the collision-avoidance
+  // trade-off is acceptable. Headless-master pairing indicator stays off
+  // for SYNC by design (routine traffic, not pairing), so we go directly
+  // to scheduleSend rather than through headlessSendTx().
+  if (!RaceLinkTransport::scheduleSend(rl, out, n, /*jitterMaxMs=*/0)) return;
+  headless.lastBroadcastAtMs = now;
+
+  // Master self-sync: mirror what slaves run in handleSync() for M=S (master
+  // is its own clock). Slaves do strip.timebase = (M - S) - activePhaseOffsetMs;
+  // with M=S that collapses to strip.timebase = -activePhaseOffsetMs. Without
+  // this, the master's strip.timebase keeps whatever value the last
+  // setActivePhaseOffsetMs() delta-adjustment left behind — a one-time
+  // perturbation by WLED-internal effect transitions / setMode resets stays
+  // uncorrected and the master drifts away from the slave fleet over time.
+  strip.timebase = (uint32_t)(-(int32_t)activePhaseOffsetMs);
+}
+
+// ========= Headless persistence pump =========
+// Slave-registry data ops (find/upsert/clear) live in racelink_headless.h
+// as free functions in the RaceLinkHeadless namespace — they are WLED-
+// neutral and reusable from external Gateway-side code. Callers in this
+// file invoke them directly on the headlessSlaves[] member.
+
+void UsermodRaceLink::markHeadlessPersistDirty() {
+  RaceLinkHeadless::markPersistDirty(headlessPersist, millis());
+}
+
+void UsermodRaceLink::serviceHeadlessPersist(uint32_t now) {
+  if (!RaceLinkHeadless::persistDebounceElapsed(
+          headlessPersist, now,
+          RaceLinkHeadless::HEADLESS_PERSIST_DEBOUNCE_MS)) return;
+  configNeedsWrite = true;
+  RaceLinkHeadless::persistConsumed(headlessPersist);
+}
+
+// ========= Headless scene rebroadcast (debounced one-shot) =========
+
+void UsermodRaceLink::scheduleSceneRebroadcast() {
+  // No-op without a current scene — nothing to rebroadcast. Headless master
+  // that booted into the no-scene state (currentSceneIdx == 0xFF) has
+  // nothing to push; freshly bound slaves stay on their boot color until
+  // the operator picks a scene via 1-click.
+  if (headless.currentSceneIdx >= RaceLinkHeadless::SCENE_CATALOG_SIZE) return;
+  RaceLinkHeadless::scheduleSceneRebroadcast(
+      headlessSceneRebroadcast, millis(),
+      RaceLinkHeadless::HEADLESS_SCENE_REBROADCAST_DEBOUNCE_MS);
+}
+
+void UsermodRaceLink::serviceSceneRebroadcast(uint32_t now) {
+  if (!RaceLinkHeadless::sceneRebroadcastReady(headlessSceneRebroadcast, now)) return;
+  RaceLinkHeadless::sceneRebroadcastConsumed(headlessSceneRebroadcast);
+  // Lost master role mid-debounce — drop the rebroadcast silently.
+  if (!headless.active) return;
+  headlessBroadcastCurrentScene();
+}
+
+// ========= Headless TX wrapper + re-bind sequencer =========
+
+bool UsermodRaceLink::headlessSendTx(const uint8_t* pkt, uint8_t n, bool armBlip) {
+  bool ok = RaceLinkTransport::scheduleSend(rl, pkt, n);
+  if (!ok || !armBlip || !headless.active) return ok;
+  if (!RaceLinkHeadless::shouldFirePairingBlip(
+          lastPairingBlipAtMs, millis(),
+          RaceLinkHeadless::HEADLESS_PAIRING_INDICATOR_THROTTLE_MS)) {
+    return ok;
+  }
+  applyLocalIndicatorMs(RaceLinkIndicators::IND_PAIRING_TX,
+                        RaceLinkHeadless::HEADLESS_PAIRING_INDICATOR_DURATION_MS);
+  return ok;
+}
+
+void UsermodRaceLink::startHeadlessReassign() {
+  // Grace delay: enterHeadlessMode() emits a scene/SYNC broadcast immediately
+  // before calling startHeadlessReassign(). Without this delay the first
+  // SET_GROUP try fires in the same loop tick and finds the TX queue still
+  // occupied by the broadcast (rl.txPending == true) — scheduleSend returns
+  // false. The retry-on-busy logic in serviceHeadlessReassign would recover,
+  // but the explicit grace delay avoids the noise.
+  RaceLinkHeadless::startReassign(
+      headlessReassign, headlessSlavesCount,
+      millis() + RaceLinkHeadless::HEADLESS_REASSIGN_INTERVAL_MS);
+  if (headlessSlavesCount > 0) {
+    DEBUG_PRINTF_P(PSTR("[RaceLink] Headless: re-bind sweep over %u slaves\n"),
+                   (unsigned)headlessSlavesCount);
+  }
+}
+
+void UsermodRaceLink::serviceHeadlessReassign(uint32_t now) {
+  // Sweep complete? Fire the post-pairing scene rebroadcast once, then idle.
+  if (RaceLinkHeadless::reassignSweepCompleted(headlessReassign, headlessSlavesCount)) {
+    scheduleSceneRebroadcast();
+    RaceLinkHeadless::abortReassign(headlessReassign);
+    return;
+  }
+  // Lost master role or radio dropped mid-sweep — abort.
+  if (headlessReassign.cursor != 0xFF
+      && (!headless.active || !radioReady || !rl.macReadOK)) {
+    RaceLinkHeadless::abortReassign(headlessReassign);
+    return;
+  }
+
+  const uint8_t idx = RaceLinkHeadless::pickReassignTarget(
+      headlessReassign, headlessSlavesCount, now);
+  if (idx == 0xFF) return;   // idle / not yet due
+
+  const auto& s = headlessSlaves[idx];
+  uint8_t out[32];
+  uint8_t n = RaceLinkHeadless::buildSetGroupPacket(out, rl.myLast3, s.addr3, s.groupId);
+  if (!n) {
+    // Packet builder failure — never expected for SET_GROUP, but if it
+    // happens we skip this slot to avoid an infinite loop and move on.
+    DEBUG_PRINTF_P(PSTR("[RaceLink] Headless: re-bind skip idx=%u (build failed)\n"),
+                   (unsigned)idx);
+    RaceLinkHeadless::confirmReassignSent(headlessReassign, now,
+        RaceLinkHeadless::HEADLESS_REASSIGN_INTERVAL_MS);
+    return;
+  }
+  if (!headlessSendTx(out, n, /*armBlip=*/true)) {
+    // TX queue busy — the initial scene/SYNC broadcast or a preceding slave's
+    // ACK is still occupying the single-slot transport. Defer same slot.
+    DEBUG_PRINTF_P(PSTR("[RaceLink] Headless: re-bind retry idx=%u (TX busy)\n"),
+                   (unsigned)idx);
+    RaceLinkHeadless::deferReassignRetry(headlessReassign, now,
+        RaceLinkHeadless::HEADLESS_REASSIGN_INTERVAL_MS);
+    return;
+  }
+  RaceLinkHeadless::confirmReassignSent(headlessReassign, now,
+      RaceLinkHeadless::HEADLESS_REASSIGN_INTERVAL_MS);
+}
+
+void UsermodRaceLink::headlessAssignGroupTo(const uint8_t senderLast3[3],
+                                            uint8_t inGroupId) {
+  using namespace RaceLinkProto;
+  if (!radioReady || !rl.macReadOK) return;
+
+  // Case A: slave reports an existing groupId. Sync our table so a later
+  // master reboot can re-bind it proactively, but do NOT send SET_GROUP —
+  // re-assigning a working pairing risks a group collision elsewhere.
+  if (inGroupId != 0) {
+    if (RaceLinkHeadless::upsertSlave(headlessSlaves, headlessSlavesCount,
+                                      RaceLinkHeadless::HEADLESS_MAX_SLAVES,
+                                      senderLast3, inGroupId)) {
+      markHeadlessPersistDirty();
+    }
+    return;
+  }
+
+  // Case B: slave reports groupId=0 (fresh, factory-reset, or pool member).
+  // If we already know this MAC, recycle its previous group ID instead of
+  // burning a fresh counter slot. Otherwise pull the next free ID.
+  int8_t existing = RaceLinkHeadless::findSlaveIdx(headlessSlaves,
+                                                   headlessSlavesCount,
+                                                   senderLast3);
+  uint8_t assigned;
+  bool fromCounter = false;
+  if (existing >= 0) {
+    assigned = headlessSlaves[existing].groupId;
+  } else {
+    // Reserve the next free ID. Header helper clamps below-range counters
+    // up to HEADLESS_FIRST_GROUP_ID and returns 0 on exhaustion.
+    assigned    = RaceLinkHeadless::reserveNextGroupId(overrides.headlessGroupCounter);
+    fromCounter = true;
+    if (assigned == 0) {
+      DEBUG_PRINTLN(F("[RaceLink] Headless: group counter exhausted — refusing assignment"));
+      return;
+    }
+    if (!RaceLinkHeadless::upsertSlave(headlessSlaves, headlessSlavesCount,
+                                       RaceLinkHeadless::HEADLESS_MAX_SLAVES,
+                                       senderLast3, assigned)) {
+      // Roll back the counter bump so we don't leave a gap.
+      overrides.headlessGroupCounter = assigned;
+      DEBUG_PRINTLN(F("[RaceLink] Headless: slave table full — refusing assignment"));
+      return;
+    }
+  }
+
+  uint8_t out[32];
+  uint8_t n = RaceLinkHeadless::buildSetGroupPacket(out, rl.myLast3, senderLast3, assigned);
+  if (!n) {
+    // Roll back the counter bump so we don't leave a gap if we never sent.
+    if (fromCounter) overrides.headlessGroupCounter = assigned;
+    return;
+  }
+  headlessSendTx(out, n, /*armBlip=*/true);
+  markHeadlessPersistDirty();
+  headless.lastBroadcastAtMs = millis();
+  // Schedule a one-shot scene rebroadcast so the freshly paired slave snaps
+  // to the current visual state instead of staying on its boot color until
+  // the operator next changes the scene. Debounced, so a burst of pairings
+  // (e.g. multiple slaves powering on within seconds) collapses to one
+  // OPC_HEADLESS packet.
+  scheduleSceneRebroadcast();
+  DEBUG_PRINTF_P(PSTR("[RaceLink] Headless: assigned group %u to %02X:%02X:%02X (%s)\n"),
+                 (unsigned)assigned,
+                 senderLast3[0], senderLast3[1], senderLast3[2],
+                 fromCounter ? "new" : "recycled");
+}
+
+void UsermodRaceLink::applyLocalScene(uint8_t sceneId, uint8_t brightness) {
+  const RaceLinkHeadless::HeadlessScene* s = RaceLinkHeadless::findSceneById(sceneId);
+  if (!s) {
+    // Unknown scene-id from a future catalog version — silently drop.
+    return;
+  }
+  // A new scene preempts any running indicator overlay: the scene visual
+  // is the new authoritative state, so an end-of-indicator restore would
+  // just overwrite it. cancelIndicator drops the active flag without
+  // touching the segment — the writes below set the final state.
+  cancelIndicator();
+
+  // Per-group phase offset for staggered fleet effects (e.g. Offset Breathe).
+  // Computed locally from the catalog row × this device's groupId so the
+  // wire surface stays a single OPC_HEADLESS packet — no separate OPC_OFFSET
+  // is needed (which would race the scene packet in the single-slot TX
+  // queue). Receivers and the Headless master itself run the same math.
+  // Non-offset rows snap back to a zero phase offset to clean up after a
+  // previous offset scene.
+  int32_t newOffsetMs = 0;
+  if (s->offsetMode == RaceLinkProto::OFFSET_MODE_LINEAR) {
+    int32_t v = (int32_t)s->offsetBase
+              + (int32_t)current.groupId * (int32_t)s->offsetStep;
+    if (v < 0)        v = 0;
+    if (v > 0xFFFF)   v = 0xFFFF;
+    newOffsetMs = v;
+  }
+
+  if (s->flags & RaceLinkHeadless::SCENE_FLAG_ALL_OFF) {
+    bri = 0;
+    setActivePhaseOffsetMs(newOffsetMs);
+    stateUpdated(CALL_MODE_NO_NOTIFY);
+    return;
+  }
+
+  if (s->flags & RaceLinkHeadless::SCENE_FLAG_RESTORE_LOCAL) {
+    // Each device returns to ITS OWN persisted boot color. setup() guarantees
+    // overrides.bootColorMode is in 0..3 (rolling + saving a fresh value on
+    // first boot), so applyBootColor() is always well-defined here regardless
+    // of whether this device showed its boot color locally (bootPreset == 0).
+    applyBootColor();
+    bri = brightness ? brightness : briS;
+    setActivePhaseOffsetMs(newOffsetMs);
+    stateUpdated(CALL_MODE_NO_NOTIFY);
+    return;
+  }
+
+  // Normal scene: write mode/speed/intensity/color1 directly to the main
+  // segment. No fancy fieldMask logic — the catalog row already filtered.
+  Segment& seg = strip.getMainSegment();
+  seg.setMode(s->fxMode);
+  if (s->speed)     seg.speed     = s->speed;
+  if (s->intensity) seg.intensity = s->intensity;
+  // color1 is 0xRRGGBB; pack to RGBW32 with W=0.
+  const uint8_t r = (uint8_t)((s->color1 >> 16) & 0xFF);
+  const uint8_t g = (uint8_t)((s->color1 >>  8) & 0xFF);
+  const uint8_t b = (uint8_t)((s->color1      ) & 0xFF);
+  seg.setColor(0, RGBW32(r, g, b, 0));
+
+  bri = brightness ? brightness : briS;
+  setActivePhaseOffsetMs(newOffsetMs);
+  stateUpdated(CALL_MODE_NO_NOTIFY);
+}
+
+// ===================== Indicators =====================
+// Catalog + state struct live in racelink_indicators.h so external Gateway
+// software (FPVGate) can build OPC_INDICATE packets via the same shared
+// definitions. The local-apply / overlay-render logic is WLED-specific
+// and stays here.
+//
+// Rendering: the indicator is painted as a frame-buffer overlay in
+// handleOverlayDraw(), which WLED calls after every segment effect has
+// rendered + blended, immediately before strip.show(). The underlying
+// effect (Traffic Light, Palette, Fireworks, …) keeps running
+// untouched — its SEGENV state, palette, colours, and any heap data
+// remain intact for the full indicator duration, so fleet phase sync
+// is preserved automatically with no catch-up burst on exit.
+
+void UsermodRaceLink::applyLocalIndicator(uint8_t type, uint8_t durationSec) {
+  if (durationSec == 0) {
+    // Wire-level cancel: stop overlay immediately; the underlying
+    // effect's pixels become visible on the next strip.show().
+    cancelIndicator();
+    return;
+  }
+
+  const RaceLinkIndicators::IndicatorDef* d = RaceLinkIndicators::findIndicator(type);
+  if (!d) return; // unknown type — silently drop (forward compat)
+
+  // Capture the catalog values the overlay renderer needs each frame.
+  // No segment mutation here — handleOverlayDraw() does all painting.
+  indicator.active            = true;
+  indicator.expiresAtMs       = millis() + (uint32_t)durationSec * 1000u;
+  indicator.activeColor1      = d->color1;
+  indicator.activeSpeed       = d->speed;
+  indicator.activeBrightness  = d->brightness;
+
+  DEBUG_PRINTF_P(PSTR("[RaceLink] Indicator: type=%u dur=%us (%s)\n"),
+                 (unsigned)d->type, (unsigned)durationSec, d->label);
+}
+
+void UsermodRaceLink::applyLocalIndicatorMs(uint8_t type, uint32_t durationMs) {
+  if (durationMs == 0) {
+    cancelIndicator();
+    return;
+  }
+  const RaceLinkIndicators::IndicatorDef* d = RaceLinkIndicators::findIndicator(type);
+  if (!d) return;
+  indicator.active            = true;
+  indicator.expiresAtMs       = millis() + durationMs;
+  indicator.activeColor1      = d->color1;
+  indicator.activeSpeed       = d->speed;
+  indicator.activeBrightness  = d->brightness;
+}
+
+void UsermodRaceLink::serviceIndicator(uint32_t now) {
+  if (!indicator.active) return;
+  if ((int32_t)(now - indicator.expiresAtMs) < 0) return;
+  // Expired: just drop the flag. The underlying effect was never
+  // disturbed; its pixels are already correct, so the next
+  // strip.show() — running without the overlay overwrite — shows
+  // them immediately. No setMode / setColor / setPalette restore
+  // required.
+  indicator.active = false;
+}
+
+void UsermodRaceLink::cancelIndicator() {
+  // Drop the overlay; underlying effect surfaces on the next frame.
+  indicator.active = false;
+}
+
+// Called by strip's show-callback after all segment effects have been
+// rendered and blended, just before pixels are pushed to hardware.
+// We overwrite the main segment's pixels for the strobe's on-frame and
+// blank them for the off-frame — a covered overlay that's visually
+// identical to the legacy setMode(STROBE) implementation but without
+// touching any segment state. The underlying effect renders normally
+// each frame; we simply replace its output for the indicator duration.
+void UsermodRaceLink::handleOverlayDraw() {
+  if (!indicator.active) return;
+
+  // Strobe waveform mirrored from FX.cpp blink() (with strobe=true)
+  // so the catalog ``speed`` field produces the same visual tempo as
+  // the legacy STROBE-effect path did. cycleTime grows with lower
+  // speed; onTime is one frame (~16 ms) for a sharp strobe pulse.
+  const uint32_t cycleTime = ((uint32_t)(255 - indicator.activeSpeed)) * 20u
+                           + (uint32_t)FRAMETIME * 2u;
+  const uint32_t rem       = strip.now % cycleTime;
+  const bool     onFrame   = rem < (uint32_t)FRAMETIME;
+
+  // Pre-scale catalog colour by catalog brightness. We can't write the
+  // global ``bri`` (would also dim the underlying effect's frame); the
+  // per-pixel pre-scale gives an equivalent visual under the global
+  // bri pipeline that runs later in strip.show().
+  uint32_t paintColor = 0;
+  if (onFrame) {
+    const uint32_t c   = indicator.activeColor1;
+    const uint32_t bri8 = indicator.activeBrightness;
+    const uint8_t r = (uint8_t)((((c >> 16) & 0xFF) * bri8) / 255u);
+    const uint8_t g = (uint8_t)((((c >>  8) & 0xFF) * bri8) / 255u);
+    const uint8_t b = (uint8_t)((((c      ) & 0xFF) * bri8) / 255u);
+    paintColor = RGBW32(r, g, b, 0);
+  } // else paintColor stays 0 = black (covered overlay)
+
+  // Write directly into the strip frame-buffer via strip.setPixelColor(),
+  // NOT via seg.setPixelColor(). The segment-relative writer targets the
+  // segment's own pixel array, which has already been blended into the
+  // strip frame-buffer (FX_fcn.cpp:1648-1650) BEFORE this callback fires
+  // — segment-level writes here would land in a dead buffer that's never
+  // pushed to hardware. Same pattern as the built-in analog clock overlay
+  // (overlay.cpp:44-49).
+  Segment& seg = strip.getMainSegment();
+  if (seg.stop == 0) return; // invalid segment guard
+  for (unsigned i = seg.start; i < seg.stop; ++i) {
+    strip.setPixelColor(i, paintColor);
+  }
+}
 
 // construct & register usermod
 static UsermodRaceLink racelink_wled;

@@ -2,6 +2,8 @@
 
 #include "wled.h"
 #include "racelink_transport_core.h"
+#include "racelink_headless.h"
+#include "racelink_indicators.h"
 //#include "racelink_proto.h"
 
 // ===================== RaceLink / RadioLib =====================
@@ -309,6 +311,7 @@ public:
   // ----- WLED Usermod API -----
   void setup() override;
   void loop() override;
+  void handleOverlayDraw() override;
   void addToJsonInfo(JsonObject& root) override;
   void addToConfig(JsonObject& root) override;
   bool readFromConfig(JsonObject& root) override;
@@ -380,6 +383,25 @@ private:
     uint16_t seg1Stop      = (uint16_t)RACELINK_DEFAULT_SEG1_STOP;
     uint8_t  briS          = (uint8_t)RACELINK_DEFAULT_BRIS;
     uint16_t transitionMs  = (uint16_t)RACELINK_DEFAULT_TRANSITION_MS;
+    // Headless Mode runtime persistence. Survives reboot so a device that
+    // was promoted to Headless Master re-runs the probe at boot and
+    // re-claims master ownership if no real Gateway has taken over.
+    // ``headlessGroupCounter`` is the next groupId Headless will assign;
+    // slave-side groupId persistence is independent (see "groupId" key).
+    // ``headlessCurrentScene`` survives so a re-promoted master broadcasts
+    // the last visual state once on re-entry.
+    bool     headlessPersistedActive = false;
+    uint8_t  headlessGroupCounter    = 0;     // 0 = unused; first assignment becomes HEADLESS_FIRST_GROUP_ID
+    uint8_t  headlessCurrentScene    = 0xFF;  // 0xFF = none
+    uint8_t  headlessBroadcastBri    = 128;
+    // Persistent per-device boot color. Mode 0/1/2 = R/G/B (primaries); mode 3
+    // means "use the stored RGB triple verbatim" (operator settled on a random
+    // cycle position). 0xFF = uninitialized, triggers a one-shot esp_random()
+    // pick in setup() that immediately persists itself.
+    uint8_t  bootColorMode = 0xFF;
+    uint8_t  bootColorR    = 0;
+    uint8_t  bootColorG    = 0;
+    uint8_t  bootColorB    = 0;
   } overrides;
 
   //UsermodBattery* bat = nullptr;
@@ -528,7 +550,64 @@ private:
     uint8_t  nextPrimaryIdx       = 0;
     uint8_t  primariesShownCount  = 0;
     uint32_t lastColorClickMs     = 0;
+    // Runtime mirror of the persisted boot color (see overrides.bootColor*).
+    // Mode 0/1/2 = R/G/B primary, mode 3 = stored RGB triple. Updated by
+    // every applyCycleColor() call so a click-burst reaches the save path
+    // with the currently-displayed color. SCENE_RESTORE_BOOT_COLOR replays
+    // exactly these fields via applyBootColor().
+    uint8_t  bootColorMode        = 0;
+    uint8_t  bootColorRgb[3]      = {0, 0, 0};
+    // Edge-trigger: set by applyColorCycleStep() on every operator click,
+    // cleared by serviceBootColorSave() after the post-click idle window
+    // (RACELINK_BTN_COLOR_RESET_MS) elapses and overrides.bootColor* has
+    // been written + configNeedsWrite set. Without this flag the save would
+    // re-fire on every loop() tick while the click is older than 10 s.
+    bool     bootColorSavePending = false;
   } btn;
+
+  // Headless Mode session state (catalog + state struct lives in
+  // racelink_headless.h so external Gateway-side software can reuse it).
+  RaceLinkHeadless::HeadlessState headless;
+
+  // Persistent slave registry for the Headless Master. Survives reboot via
+  // cfg.json so a master that loses power mid-event re-binds its previously
+  // assigned slaves on resume (proactive SET_GROUP burst via
+  // serviceHeadlessReassign), and so an unconfigured slave reporting
+  // groupId=0 with a known MAC gets its old ID recycled instead of a fresh
+  // counter increment. Cleared on exitHeadlessMode() — exit is the operator
+  // signal to drop the whole pairing context.
+  RaceLinkHeadless::HeadlessSlaveRec headlessSlaves[RaceLinkHeadless::HEADLESS_MAX_SLAVES];
+  uint8_t  headlessSlavesCount   = 0;
+  // Persistence pump: state struct + free helpers live in racelink_headless.h
+  // (RaceLinkHeadless::PersistState / markPersistDirty / persistDebounceElapsed).
+  // markHeadlessPersistDirty() arms it via the header helper;
+  // serviceHeadlessPersist() flips configNeedsWrite once
+  // HEADLESS_PERSIST_DEBOUNCE_MS of quiet have elapsed. Collapses a 40-slave
+  // pairing burst into a single cfg.json write instead of 40.
+  RaceLinkHeadless::PersistState headlessPersist;
+  // Proactive re-bind cursor — state struct + free helpers in
+  // racelink_headless.h. startHeadlessReassign() arms it from
+  // enterHeadlessMode(); serviceHeadlessReassign() drives it tick by tick.
+  RaceLinkHeadless::ReassignState headlessReassign;
+  // Throttle for the IND_PAIRING_TX overlay so back-to-back SET_GROUP sends
+  // (most notably the post-reboot re-bind sweep over the slave registry) do
+  // not re-extend the indicator deadline into a continuous overlay.
+  uint32_t lastPairingBlipAtMs   = 0;
+  // Debounced one-shot scene rebroadcast. State struct + free helpers in
+  // racelink_headless.h. scheduleSceneRebroadcast() arms it after a
+  // successful SET_GROUP send (proactive pairing or end-of-reassign sweep);
+  // serviceSceneRebroadcast() fires headlessBroadcastCurrentScene() once
+  // the deadline passes, so freshly bound slaves snap to the master's
+  // visual state without the operator needing to manually cycle the scene.
+  RaceLinkHeadless::SceneRebroadcastState headlessSceneRebroadcast;
+
+  // Indicator overlay state (catalog + state struct in racelink_indicators.h).
+  // applyLocalIndicator() snapshots the segment, paints the indicator and
+  // sets an expiry deadline; serviceIndicator() restores the snapshot when
+  // the deadline elapses. cancelIndicator() is called from preemption
+  // sites (incoming wire commands / explicit role transitions) to drop
+  // the overlay without restoring — the new command brings its own visual.
+  RaceLinkIndicators::IndicatorState indicator;
 
   // Discovery reply target
   uint8_t targetForReplyLast3[3] = {0};
@@ -571,13 +650,20 @@ private:
   // and provide a boot-time fallback when the operator did not configure a
   // boot preset).
   void showPairConfirmedEffect();
-  void showBootRandomColor();
+  // Replays the persisted boot color (overrides.bootColor* / btn.bootColor*)
+  // onto the strip. Used at boot when bootPreset==0 and by the
+  // SCENE_RESTORE_BOOT_COLOR handler.
+  void applyBootColor();
 
   // Colour-cycle helpers. applyCycleColor() writes colPri + the segment for
   // a given index (0=R, 1=G, 2=B, >=3=random); applyColorCycleStep() handles
   // the click-driven advance with idle-window reset.
   void applyCycleColor(uint8_t idx);
   void applyColorCycleStep(uint32_t now);
+  // Deferred persistence of an operator-driven boot color change. Pumped from
+  // loop(); writes overrides.bootColor* + sets configNeedsWrite once the
+  // post-click idle window has elapsed.
+  void serviceBootColorSave(uint32_t now);
 
   // Master-contact tracking for the button-quiet gate.
   bool masterContactedRecently() const;
@@ -587,6 +673,113 @@ private:
   void pollPhysicalButton(uint32_t now); // own poll, called from loop()
   void handleRaceLinkButton(uint8_t b, bool pressed, uint32_t now);
   void serviceButtonFade(uint32_t now);
+
+  // ===== Headless Mode =====
+  // Five-click on the button (or boot-time auto-resume when persisted)
+  // promotes a device to Headless Master: it assigns groups to incoming
+  // unpaired nodes, broadcasts scene IDs + brightness, and acts as the
+  // sole network presence for a minimal session — replacing the Gateway
+  // + Host pair for the duration. See the plan file
+  //   .claude/plans/plane-nun-die-details-rippling-lark.md
+  // for the full rationale; the scene catalog + packet builders live in
+  // racelink_headless.h so external software (FPVGate) can reuse them.
+
+  // Start the IDENTIFY_REPLY probe sequence. Schedules two broadcasts
+  // inside HEADLESS_PROBE_TIMEOUT_MS with random jitter; serviceHeadless()
+  // promotes the device if no OPC_SET_GROUP arrives during the window.
+  // If already-active, toggles back to a normal node.
+  void tryStartHeadless();
+  // Loop-tick: emits scheduled probe broadcasts, evaluates the timeout,
+  // and runs the keepalive (re-broadcast current scene every
+  // HEADLESS_SCENE_KEEPALIVE_MS while active).
+  void serviceHeadless(uint32_t now);
+  // Probe succeeded -> enter active mode: persist state, broadcast last
+  // scene once, pulse blue 3× as visual feedback.
+  void enterHeadlessMode();
+  // Leave active mode (5-click toggle or Gateway-takeover OPC_SET_GROUP).
+  // Clears persisted-active flag and stops keepalive emissions.
+  void exitHeadlessMode();
+  // Pick next catalog entry, store, broadcast it. Called by single-click
+  // while headless.active.
+  void headlessAdvanceScene();
+  // Build and broadcast the scene packet at ``overrides.headlessCurrentScene``.
+  // Receivers expand the scene locally via the shared catalog, including
+  // per-group phase offset for SCENE_FLAG_USE_OFFSET rows — so the wire
+  // surface is exactly one OPC_HEADLESS packet (no OPC_OFFSET pre-emit, which
+  // would race the scene packet against the single-slot TX queue).
+  // Also applies the scene locally on this device.
+  void headlessBroadcastCurrentScene();
+  // Build and broadcast a 4B-form OPC_SYNC (autosync, no flags byte) carrying
+  // the master's local millis() timestamp and current brightness. Drives the
+  // slaves' strip.timebase and refreshes their masterContactedRecently() gate.
+  void headlessBroadcastSync(uint32_t now);
+  // Headless master receives IDENTIFY_REPLY from a node: pair into the
+  // next free group. Idempotent paths: (a) node already advertises a non-
+  // zero group → sync our table with that value, send nothing; (b) node
+  // reports groupId=0 but we know its MAC from a prior pairing → recycle
+  // the stored ID instead of incrementing the counter.
+  void headlessAssignGroupTo(const uint8_t senderLast3[3], uint8_t inGroupId);
+
+  // ===== Headless slave registry helpers =====
+  // The data-ops live in racelink_headless.h (RaceLinkHeadless::findSlaveIdx,
+  // upsertSlave, clearSlaveTable) — call those directly on the
+  // ``headlessSlaves[]`` member + ``headlessSlavesCount`` reference. Kept
+  // out of this class to stay WLED-neutral and reusable from Gateway-side.
+
+  // Arm the debounced persistence pump. Cheap, may be called from inside
+  // an existing TX path without forcing an immediate flash write.
+  void   markHeadlessPersistDirty();
+  // Loop-tick: writes cfg.json once HEADLESS_PERSIST_DEBOUNCE_MS of quiet
+  // have elapsed since the last table mutation.
+  void   serviceHeadlessPersist(uint32_t now);
+
+  // ===== Headless re-bind sequencer =====
+  // After Headless master is fully promoted (manual 5-click OR auto-resume
+  // probe success), iterate the persisted slave table and send one
+  // SET_GROUP per HEADLESS_REASSIGN_INTERVAL_MS so slaves that did NOT
+  // power-cycle along with the master pick up their old group ID.
+  void startHeadlessReassign();
+  void serviceHeadlessReassign(uint32_t now);
+
+  // Arm the debounced one-shot scene rebroadcast. Called from
+  // headlessAssignGroupTo() after a successful proactive SET_GROUP and at
+  // the end of serviceHeadlessReassign() when the boot-time sweep completes.
+  // The actual broadcast fires from serviceSceneRebroadcast() after a short
+  // delay so freshly-bound slaves' ACKs have time to clear the channel.
+  void scheduleSceneRebroadcast();
+  void serviceSceneRebroadcast(uint32_t now);
+
+  // Single chokepoint for Headless-master TX. Wraps
+  // RaceLinkTransport::scheduleSend() so the SET_GROUP send sites can arm
+  // the throttled IND_PAIRING_TX overlay via a single boolean argument.
+  // ``armBlip=true`` is reserved for SET_GROUP sends (new-device pairing
+  // and the post-reboot re-bind sweep); every other master TX path
+  // (probe, scene broadcast, brightness broadcast, SYNC keepalive) sets
+  // ``armBlip=false`` because the operator-visible signal is "pairing",
+  // not "any transmission."
+  bool headlessSendTx(const uint8_t* pkt, uint8_t n, bool armBlip);
+  // Local expansion of a scene catalog row. Runs on every device — the
+  // headless master invokes it directly; slaves dispatch to it from the
+  // OPC_HEADLESS wire handler. ``brightness`` overrides bri unless the row
+  // carries SCENE_FLAG_ALL_OFF (which forces bri=0).
+  void applyLocalScene(uint8_t sceneId, uint8_t brightness);
+  // ===== Indicators =====
+  // Apply a catalog-defined indicator overlay on the local strip for
+  // ``durationSec`` seconds, then auto-restore the pre-indicator segment
+  // state. ``durationSec == 0`` cancels any active indicator without
+  // showing a new one. Unknown ``type`` is silently dropped (forward-
+  // compatible with future catalog rows).
+  void applyLocalIndicator(uint8_t type, uint8_t durationSec);
+  // Millisecond variant used by sub-second triggers (Headless TX heartbeat).
+  // Identical semantics to applyLocalIndicator otherwise — caller sets the
+  // duration directly in ms so we don't quantise short blips to 1 s.
+  void applyLocalIndicatorMs(uint8_t type, uint32_t durationMs);
+  // Loop-tick: restore the snapshot once the indicator's expiry elapses.
+  void serviceIndicator(uint32_t now);
+  // Drop the indicator's active flag without restoring the snapshot. Used
+  // at preemption sites where a new visual is about to overwrite the
+  // segment anyway — restoring first would be a wasted segment write.
+  void cancelIndicator();
 
   // Radio helpers
   bool radioInit();
@@ -606,6 +799,13 @@ private:
   void sendGetConfigReplyTo(const uint8_t destLast3[3], uint8_t option,
                             uint8_t data0, uint8_t data1,
                             uint8_t data2, uint8_t data3);
+  // OPC_GET_RF_CONFIG reply (12B body = P_RfConfig). Sent in response
+  // to an OPC_GET_RF_CONFIG read-back from the host. The body carries
+  // the node's currently active LoRa PHY config (the NVS-persisted
+  // values that radioInit() applied at boot, plus any subsequent
+  // OPC_RF_CONFIG-driven changes that will take effect after the
+  // queued reboot).
+  void sendRfConfigReplyTo(const uint8_t destLast3[3]);
   void serviceStartupIdentifyReplies();
 
   // Build frames
