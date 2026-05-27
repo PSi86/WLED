@@ -139,7 +139,10 @@
       "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -e RaceLink_Node_v3_s2_llcc68 2>&1 | Select-Object -Last 8)",
       "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -e RaceLink_Node_v3_s2_llcc68 2>&1 | Select-Object -Last 6)",
       "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -e RaceLink_Node_v3_s2_llcc68 2>&1 | Select-Object -Last 10)",
-      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -e RaceLink_Node_v3_s2_llcc68 -e RaceLink_Node_v4_s3_llcc68 2>&1 | Select-Object -Last 10)"
+      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" run -e RaceLink_Node_v3_s2_llcc68 -e RaceLink_Node_v4_s3_llcc68 2>&1 | Select-Object -Last 10)",
+      "Bash(awk '{print $6, $7, $8, $9}')",
+      "Bash(cp \"C:/Users/psima/Dev/WLED LoRa/WLED/usermods/racelink_wled/rf_config_nvs.h\" \"C:/Users/psima/Dev/RaceLink_WLED/rf_config_nvs.h\")",
+      "Bash(cp \"C:/Users/psima/Dev/WLED LoRa/WLED/usermods/racelink_wled/rf_config_nvs.h\" \"C:/Users/psima/Dev/RaceLink_Gateway/src/rf_config_nvs.h\")"
     ]
   }
 }

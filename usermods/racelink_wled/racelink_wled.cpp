@@ -484,17 +484,22 @@ void UsermodRaceLink::addToConfig(JsonObject& root) {
     top[F("First Slot (1-8)")] = firstSlot;
   #endif
 
-  // masterLast3: only persist when persistence is enabled
+  // Persisted master snapshot. We always serialise the stored slot, not
+  // the live one — so toggling macFilterPersist or running OPC_RF_CONFIG
+  // (which flips persistence off) doesn't lose the operator's pinned
+  // binding. persistMasterIfNeeded() refreshes the slot when the
+  // operator wants the current master pinned. clearMaster() only
+  // touches the live state; the snapshot survives.
   char m3[7+1];
-  sprintf(m3, "%02X%02X%02X", masterLast3[0], masterLast3[1], masterLast3[2]);
-  top["masterLast3"] = (macFilterPersist && masterKnown) ? String(m3) : String("000000");
+  sprintf(m3, "%02X%02X%02X",
+          persistedMasterLast3[0], persistedMasterLast3[1], persistedMasterLast3[2]);
+  top["masterLast3"] = String(m3);
 
-  // masterFullMac: only persist when persistence is enabled
   char m6[12+1];
   sprintf(m6, "%02X%02X%02X%02X%02X%02X",
-          masterFull6[0], masterFull6[1], masterFull6[2],
-          masterFull6[3], masterFull6[4], masterFull6[5]);
-  top["masterFullMac"] = (macFilterPersist && masterFull6Known) ? String(m6) : String("");
+          persistedMasterFull6[0], persistedMasterFull6[1], persistedMasterFull6[2],
+          persistedMasterFull6[3], persistedMasterFull6[4], persistedMasterFull6[5]);
+  top["masterFullMac"] = persistedMasterFull6Known ? String(m6) : String("");
 
   // radio defaults
   JsonObject l = top.createNestedObject("RL_RF");
@@ -608,22 +613,47 @@ bool UsermodRaceLink::readFromConfig(JsonObject& root) {
     #endif
   #endif
 
-  // only adopt master from config when persistence is enabled
-  if (macFilterPersist) {
+  // ALWAYS deserialise the persisted slot, regardless of
+  // macFilterPersist — we keep the snapshot in RAM so addToConfig can
+  // round-trip it intact through a Save the operator triggers for some
+  // unrelated reason. macFilterPersist only gates whether we COPY the
+  // snapshot into the live state below.
+  {
     String s3 = top["masterLast3"] | "000000";
     if (s3.length() == 6) {
       uint32_t val = strtoul(s3.c_str(), nullptr, 16);
-      masterLast3[0] = (val >> 16) & 0xFF;
-      masterLast3[1] = (val >> 8)  & 0xFF;
-      masterLast3[2] = (val)       & 0xFF;
-      masterKnown = (val != 0);
+      persistedMasterLast3[0] = (val >> 16) & 0xFF;
+      persistedMasterLast3[1] = (val >> 8)  & 0xFF;
+      persistedMasterLast3[2] = (val)       & 0xFF;
     }
 
     String s6 = top["masterFullMac"] | "";
     if (s6.length() == 12) {
       for (int i=0;i<6;i++) {
-        masterFull6[i] = strtoul(s6.substring(2*i, 2*i+2).c_str(), nullptr, 16);
+        persistedMasterFull6[i] = strtoul(s6.substring(2*i, 2*i+2).c_str(), nullptr, 16);
       }
+      persistedMasterFull6Known = true;
+    } else {
+      persistedMasterFull6Known = false;
+      memset(persistedMasterFull6, 0, sizeof(persistedMasterFull6));
+    }
+  }
+
+  // only adopt master from the snapshot into live state when persistence
+  // is enabled. When off, the snapshot stays in RAM (and survives the
+  // next addToConfig) but masterLast3/Full6 remain at their RAM defaults
+  // so senderAllowed() goes through the !masterKnown discovery branch.
+  if (macFilterPersist) {
+    uint32_t val =
+      ((uint32_t)persistedMasterLast3[0] << 16) |
+      ((uint32_t)persistedMasterLast3[1] << 8) |
+      ((uint32_t)persistedMasterLast3[2]);
+    if (val != 0) {
+      memcpy(masterLast3, persistedMasterLast3, 3);
+      masterKnown = true;
+    }
+    if (persistedMasterFull6Known) {
+      memcpy(masterFull6, persistedMasterFull6, 6);
       masterFull6Known = true;
     }
   }
@@ -901,14 +931,28 @@ void UsermodRaceLink::learnMasterFromSender(const uint8_t s3[3], bool persistIfE
 }
 
 void UsermodRaceLink::persistMasterIfNeeded() {
-  // mark config to be saved (serialized via addToConfig)
-  requestJSONBufferLock(10);
-  releaseJSONBufferLock();
+  // Snapshot the currently-learned master into the persisted slot and
+  // queue a cfg.json save. Callers gate on (persistIfEnabled &&
+  // macFilterPersist) so this never fires when the operator has
+  // persistence off. addToConfig() reads from the persisted slot, so
+  // a same-tick Save (e.g. operator toggling something in WLED Settings)
+  // would otherwise round-trip the stale snapshot back to disk.
+  if (!masterKnown) return;
+  memcpy(persistedMasterLast3, masterLast3, 3);
+  if (masterFull6Known) {
+    memcpy(persistedMasterFull6, masterFull6, 6);
+    persistedMasterFull6Known = true;
+  }
+  configNeedsWrite = true;
 }
 
 void UsermodRaceLink::clearMaster() {
   masterKnown = false;
   memset(masterLast3, 0, 3);
+  // In-RAM only by design: the persisted slot (persistedMasterLast3)
+  // is owned by addToConfig/readFromConfig and macFilterPersist is the
+  // gate that decides whether it's applied at next boot. Clearing
+  // live state here doesn't (and shouldn't) touch the persisted value.
 }
 
 // ========= RaceLink-authoritative apply =========
@@ -1665,7 +1709,20 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
       } else if (p.option == 0x02) { // Clear learned Master
         clearMaster();
       } else if (p.option == 0x03) { // MAC Filter Persist Enable/Disable
+        const bool wasOn = macFilterPersist;
         macFilterPersist = (p.data0 != 0);
+        // On the off → on edge, snapshot whatever master is currently
+        // learned so the persisted slot reflects the operator's intent
+        // ("pin this binding"). If nothing is learned yet, leave the
+        // existing snapshot intact — the operator may have pinned a
+        // previous master that they want to re-arm at the next boot.
+        if (!wasOn && macFilterPersist) {
+          persistMasterIfNeeded();  // copies masterLast3/Full6 + queues save
+        } else {
+          // Toggle alone still needs persisting so cfg.json reflects
+          // the new macFilterPersist value at next boot.
+          configNeedsWrite = true;
+        }
       } else if (p.option == 0x04) { // Enable AP Mode
         if (p.data0 != 0) WLED::instance().initAP(true);
         else {
@@ -1921,9 +1978,23 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
       // before reboot reflects the freshly persisted values.
       g_activeRfConfig = p;
 
+      // An RF-config write implies a network move: the previously-
+      // learned master belongs to the OLD radio settings and won't
+      // exist on the destination radio. Disable master persistence so
+      // the boot-time loader (readFromConfig) ignores the persisted
+      // slot — the node will start with masterKnown=false and
+      // senderAllowed() will accept the next OPC_DEVICES / OPC_SET_GROUP
+      // from the new gateway. The persisted slot itself is intentionally
+      // left intact (the operator can re-enable persistence later to
+      // snapshot whatever master is then live). Force the cfg.json
+      // flush before restart -- the loop never gets a chance otherwise.
+      macFilterPersist = false;
+      configNeedsWrite = true;
+      serializeConfigToFS();
+
       sendAckTo(h.sender, OPC_RF_CONFIG, ACK_OK);
       acted = true;
-      DEBUG_PRINTF_P(PSTR("[RaceLink] RF_CONFIG -> stored, rebooting (freq=%lu sf=%u bw=%u sw=0x%02X)\n"),
+      DEBUG_PRINTF_P(PSTR("[RaceLink] RF_CONFIG -> stored + persistence disabled, rebooting (freq=%lu sf=%u bw=%u sw=0x%02X)\n"),
                      (unsigned long)p.freq_hz, (unsigned)p.sf,
                      (unsigned)p.bw_khz_x10, (unsigned)p.sync_word);
 

@@ -502,6 +502,17 @@ private:
   uint8_t masterFull6[6] = {0};
   bool   masterFull6Known = false;
 
+  // Persisted master snapshot. Owned by addToConfig/readFromConfig and
+  // independent of masterLast3/masterFull6 so toggling macFilterPersist
+  // (or an OPC_RF_CONFIG-driven persistence-off step) never destroys
+  // the operator's previously-pinned binding. macFilterPersist gates
+  // whether readFromConfig copies these into the live slots at boot.
+  // Snapshot points: learnMasterFromSender() with persistIfEnabled +
+  // macFilterPersist, and the OPC_CONFIG 0x03 "Enable Persist" handler.
+  uint8_t persistedMasterLast3[3] = {0};
+  uint8_t persistedMasterFull6[6] = {0};
+  bool    persistedMasterFull6Known = false;
+
   // Session-only master-contact tracking (NOT persisted) — drives the
   // physical-button master-quiet gate. lastMasterRxMs is meaningful only
   // when anyMasterRxSinceBoot is true.
