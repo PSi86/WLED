@@ -302,13 +302,40 @@ void UsermodRaceLink::addToJsonInfo(JsonObject& root) {
   JsonObject user = root["u"];
   if (user.isNull()) user = root.createNestedObject("u");
 
-  // RaceLink Init
+#if defined(RACELINK_ETH)
+  // Ethernet link + IP status (replaces the LoRa radio-init line).
+  {
+    char eth[48];
+    if (radioReady) {
+      snprintf(eth, sizeof(eth), "%s  %u.%u.%u.%u (%s)",
+               rl.linkUp ? "LINK UP" : "no link",
+               rl.ip[0], rl.ip[1], rl.ip[2], rl.ip[3],
+               rl.dhcpOk ? "DHCP" : "static");
+    } else {
+      snprintf(eth, sizeof(eth), "INIT FAIL (code %d)", (int)radioInitCode);
+    }
+    JsonArray row = user.createNestedArray(F("RaceLink ETH"));
+    row.add(eth);
+  }
+  // UDP node port + W5500 SPI pin map (build-time reference).
+  {
+    char p[12]; snprintf(p, sizeof(p), "%u", (unsigned)rl.nodePort);
+    user.createNestedArray(F("ETH UDP Port")).add(p);
+    char pinmap[40];
+    snprintf(pinmap, sizeof(pinmap), "CS%d RST%d SCK%d MI%d MO%d",
+             RACELINK_ETH_CS, RACELINK_ETH_RST, RACELINK_ETH_SCLK,
+             RACELINK_ETH_MISO, RACELINK_ETH_MOSI);
+    user.createNestedArray(F("ETH W5500 Pins")).add(pinmap);
+  }
+#else
+  // RaceLink Init (radio)
   {
     char initMsg[32];
     snprintf(initMsg, sizeof(initMsg), "%s (code %d)", radioReady ? "OK" : "FAIL", (int)radioInitCode);
     JsonArray row = user.createNestedArray(F("RaceLink Init"));
     row.add(initMsg);
   }
+#endif
 
   // MyID 3B
   {
@@ -330,13 +357,15 @@ void UsermodRaceLink::addToJsonInfo(JsonObject& root) {
     row3.add(String((unsigned long)rl.txCount));
   }
 
-  // Last RSSI/SNR
+#ifndef RACELINK_ETH
+  // Last RSSI/SNR (LoRa only; meaningless on Ethernet)
   {
     char sig[24];
     snprintf(sig, sizeof(sig), "%d / %d", (int)rl.lastRssi, (int)rl.lastSnr);
     JsonArray row = user.createNestedArray(F("Last RSSI/SNR"));
     row.add(sig);
   }
+#endif
 
   {
     JsonArray row = user.createNestedArray(F("Last RX"));
@@ -505,7 +534,8 @@ void UsermodRaceLink::addToConfig(JsonObject& root) {
           persistedMasterFull6[3], persistedMasterFull6[4], persistedMasterFull6[5]);
   top["masterFullMac"] = persistedMasterFull6Known ? String(m6) : String("");
 
-  // radio defaults
+#ifndef RACELINK_ETH
+  // radio defaults (LoRa builds only)
   JsonObject l = top.createNestedObject("RL_RF");
   l["freq"] = RACELINK_FREQ_HZ;
   l["sf"]   = RACELINK_SF;
@@ -526,6 +556,11 @@ void UsermodRaceLink::addToConfig(JsonObject& root) {
   pins[F("DIO1")] = pinDio1;
   pins[F("BUSY")] = pinBusy;
   pins[F("RST")]  = pinRst;
+#else
+  // Ethernet (W5500) builds: the SPI pins, UDP ports and DHCP/static IP mode are
+  // compile-time (RACELINK_ETH_* build flags) and shown read-only in Info.
+  // The live link/IP state is reported in addToJsonInfo().
+#endif
 
   #ifdef RACELINK_EPAPER
     JsonObject ep = top.createNestedObject("epaper_pins");
@@ -663,6 +698,7 @@ bool UsermodRaceLink::readFromConfig(JsonObject& root) {
   }
   // When persistence is off: do NOT overwrite runtime values
 
+#ifndef RACELINK_ETH
   // RaceLink radio pins. Capture old values to detect a UI change so we can
   // request a reboot (SPI re-init at runtime is not supported by design).
   // On the very first call (boot-time deserialize), suppress the reboot —
@@ -718,6 +754,7 @@ bool UsermodRaceLink::readFromConfig(JsonObject& root) {
     DEBUG_PRINTLN(F("[RaceLink] Pin config changed — rebooting to apply"));
     doReboot = true;
   }
+#endif // !RACELINK_ETH
   firstReadFromConfig = false;
 
   // RaceLink-authoritative overrides. Slots are always present in cfg.json
