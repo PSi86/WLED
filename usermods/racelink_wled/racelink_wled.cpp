@@ -269,7 +269,11 @@ void UsermodRaceLink::loop() {
   serviceSceneRebroadcast(nowMs);
   serviceIndicator(nowMs);
 
+#if defined(RACELINK_ETH)
+  if (!radioReady) return;
+#else
   if (!radio) return;
+#endif
 
   // replaces the previous flag-/ISR-/onRx() handling
   RaceLinkTransport::service(rl, cb);
@@ -816,6 +820,17 @@ void UsermodRaceLink::refreshFieldsFromSegment() {
 
 // ========= Radio =========
 bool UsermodRaceLink::radioInit() {
+#if defined(RACELINK_ETH)
+  // Ethernet (W5500/UDP) bring-up. SPI pins, RST and the UDP node port come
+  // from the RACELINK_ETH_* build flags (defaults in racelink_transport_eth.h).
+  // TODO: allocate the W5500 pins via WLED's PinManager (parity with the LoRa
+  // path) once the Stage-4 config UI exposes them.
+  radioInitCode = RaceLinkTransport::beginCommon(rl) ? 0 : -999;
+  if (radioInitCode != 0) return false;
+  rl.lbtEnable = false;                            // no LBT on a wired medium
+  RaceLinkTransport::setDefaultRxContinuous(rl);   // no-op on Ethernet
+  return true;
+#else
   // Allocate radio pins via WLED's PinManager so a misconfigured LED bus on
   // any of these pins fails loudly here instead of silently breaking SPI.
   // MISO is allowed to be -1 (some modules omit it). Skip it from the alloc
@@ -908,6 +923,7 @@ bool UsermodRaceLink::radioInit() {
   RfConfigNvs::bootCounterClear();
 
   return true;
+#endif
 }
 
 bool UsermodRaceLink::senderAllowed(const uint8_t s3[3], uint8_t opcode7) {

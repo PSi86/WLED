@@ -28,8 +28,11 @@
 
 #include <Arduino.h>
 #include <SPI.h>
-#include <Ethernet.h>     // standalone Wiznet W5500 driver (lib_deps: arduino-libraries/Ethernet)
-#include <EthernetUdp.h>
+// Self-contained W5500 UDP driver. No external library: on the pinned Tasmota
+// 2.0.18 core neither ETH.h, the IDF esp_eth W5500 driver, nor the Arduino W5500
+// socket libs are usable (see memory ethernet_block_e_stage0_w5500_decision), so
+// we talk to the W5500 directly over SPI.
+#include "racelink_w5500_udp.h"
 
 #include "racelink_transport_common.h"  // helpers, StreamStatus, RX stream templates; pulls racelink_proto.h
 
@@ -61,6 +64,17 @@
 #endif
 #ifndef RACELINK_ETH_HOST_PORT
   #define RACELINK_ETH_HOST_PORT 5079
+#endif
+// Static IP config (PoC; DHCP is a later add). Override per build profile.
+// Each macro expands to a comma-separated octet list, e.g. -D RACELINK_ETH_IP=192,168,1,177
+#ifndef RACELINK_ETH_IP
+  #define RACELINK_ETH_IP 192,168,1,177
+#endif
+#ifndef RACELINK_ETH_SUBNET
+  #define RACELINK_ETH_SUBNET 255,255,255,0
+#endif
+#ifndef RACELINK_ETH_GATEWAY
+  #define RACELINK_ETH_GATEWAY 192,168,1,1
 #endif
 
 namespace RaceLinkTransport {
@@ -105,10 +119,10 @@ struct Core {
   uint8_t  myLast3[3] = {0};
   bool     macReadOK  = false;
 
-  // --- Ethernet/UDP backend ---
-  EthernetUDP udp;
+  // --- Ethernet/UDP backend (self-contained W5500 driver) ---
+  RaceLinkW5500::Driver w5500;
   uint16_t nodePort   = RACELINK_ETH_NODE_PORT;
-  IPAddress hostIp;                 // learned host endpoint (reply target)
+  uint8_t  hostIp[4]  = {0};        // learned host endpoint (reply target)
   uint16_t hostPort   = RACELINK_ETH_HOST_PORT;
   bool     hostKnown  = false;
   bool     linkUp     = false;
@@ -161,10 +175,10 @@ struct EthCfg {
 };
 
 // -------------------- Lifecycle --------------------
-// Bring up the W5500 over a dedicated SPI bus, read the node MAC, start DHCP,
-// and bind the UDP RX socket. Returns true on a usable link + bound socket.
-// NOTE (Stage-0 follow-up): DHCP via Ethernet.begin(mac) blocks until lease or
-// timeout; a static-IP path is a Stage-4 (WLED config) concern.
+// Bring up the W5500 over the dedicated SPI bus, apply the node MAC + static
+// network config, and open the UDP RX socket on nodePort (broadcast-capable for
+// OPC_DEVICES discovery). Returns true once the chip is detected and the socket
+// reaches the UDP state. (Static IP is a PoC choice; DHCP is a later add.)
 inline bool beginCommon(Core& rl, const EthCfg& cfg = EthCfg{}) {
   rl.nodePort = cfg.nodePort;
 
@@ -174,39 +188,26 @@ inline bool beginCommon(Core& rl, const EthCfg& cfg = EthCfg{}) {
     last3FromMac6(rl.myLast3, rl.myMac6);
   }
 
-  // Hardware reset of the W5500 (active-low RST).
-  if (cfg.rst >= 0) {
-    pinMode(cfg.rst, OUTPUT);
-    digitalWrite(cfg.rst, LOW);
-    delay(2);
-    digitalWrite(cfg.rst, HIGH);
-    delay(150);  // W5500 PLL/boot settle
-  }
-
-  // Dedicated SPI bus on the W5500 pins, then point the Ethernet driver at CS.
-  SPI.begin(cfg.sclk, cfg.miso, cfg.mosi, cfg.cs);
-  Ethernet.init(cfg.cs);
-
   // Derive a locally-administered unicast MAC for the NIC from the EFUSE MAC.
-  byte mac[6];
+  uint8_t mac[6];
   if (rl.macReadOK) {
     for (int i = 0; i < 6; ++i) mac[i] = rl.myMac6[i];
   } else {
-    // Fallback MAC if EFUSE read failed.
-    static const byte fallback[6] = {0x02, 0x52, 0x4C, 0x00, 0x00, 0x01};
+    static const uint8_t fallback[6] = {0x02, 0x52, 0x4C, 0x00, 0x00, 0x01};
     for (int i = 0; i < 6; ++i) mac[i] = fallback[i];
   }
-  mac[0] = (byte)((mac[0] & 0xFE) | 0x02);  // unicast + locally administered
+  mac[0] = (uint8_t)((mac[0] & 0xFE) | 0x02);  // unicast + locally administered
 
-  // DHCP. (Ethernet.begin returns 0 on failure.)
-  if (Ethernet.begin(mac) == 0) {
+  const uint8_t ip[4]     = { RACELINK_ETH_IP };
+  const uint8_t subnet[4] = { RACELINK_ETH_SUBNET };
+  const uint8_t gw[4]     = { RACELINK_ETH_GATEWAY };
+
+  if (!rl.w5500.begin(SPI, cfg.sclk, cfg.miso, cfg.mosi, cfg.cs, cfg.rst,
+                      mac, ip, subnet, gw, rl.nodePort)) {
     rl.linkUp = false;
     return false;
   }
-  rl.linkUp = (Ethernet.linkStatus() != LinkOFF);
-
-  // Bind the UDP RX socket (broadcast-capable for OPC_DEVICES discovery).
-  rl.udp.begin(rl.nodePort);
+  rl.linkUp = rl.w5500.linkUp();   // link may still be negotiating; socket is open
   return true;
 }
 
@@ -223,15 +224,17 @@ inline void setDefaultRxContinuous(Core& /*rl*/) {}
 inline bool scheduleSend(Core& rl, const uint8_t* buf, uint8_t len, uint16_t /*jitterMaxMs*/ = 0) {
   if (!buf || len < (uint8_t)sizeof(RaceLinkProto::Header7)) return false;
 
-  const uint8_t typeByte = buf[6];           // Header7.type (bit7 set for N2M)
-  const IPAddress dst = rl.hostKnown ? rl.hostIp : IPAddress(255, 255, 255, 255);
-  const uint16_t  dport = rl.hostKnown ? rl.hostPort : (uint16_t)RACELINK_ETH_HOST_PORT;
+  // N2M datagram = [type_byte] ++ (Header7 + body), where type_byte = Header7.type.
+  uint8_t dg[1 + ETH_MAX_DGRAM];
+  if ((uint16_t)len + 1u > sizeof(dg)) return false;
+  dg[0] = buf[6];                            // Header7.type (bit7 set for N2M)
+  for (uint8_t i = 0; i < len; ++i) dg[1 + i] = buf[i];
 
-  if (rl.udp.beginPacket(dst, dport) == 0) return false;
-  rl.udp.write(typeByte);
-  rl.udp.write(buf, len);
-  const bool ok = (rl.udp.endPacket() != 0);
+  static const uint8_t kBroadcast[4] = { 255, 255, 255, 255 };
+  const uint8_t* dst   = rl.hostKnown ? rl.hostIp : kBroadcast;
+  const uint16_t dport = rl.hostKnown ? rl.hostPort : (uint16_t)RACELINK_ETH_HOST_PORT;
 
+  const bool ok = rl.w5500.sendTo(dst, dport, dg, (uint16_t)(len + 1));
   if (ok) { ++rl.txCount; rl.lastTxAtMs = millis(); }
   rl.txPending = false;  // never queued
   return ok;
@@ -242,17 +245,20 @@ inline bool scheduleSend(Core& rl, const uint8_t* buf, uint8_t len, uint16_t /*j
 // each one to cb.onRxPacket() as a reconstructed Header7 frame so the usermod's
 // handlePacket()/receiverMatches() path runs unchanged.
 inline void service(Core& rl, const Callbacks& cb) {
-  for (int sz = rl.udp.parsePacket(); sz > 0; sz = rl.udp.parsePacket()) {
+  // parsePacket() reports the next datagram's payload size; read() must follow to
+  // advance the W5500 RX pointer, so read() is called once per iteration before
+  // any `continue`.
+  for (uint16_t sz = rl.w5500.parsePacket(); sz > 0; sz = rl.w5500.parsePacket()) {
     uint8_t dg[ETH_MAX_DGRAM];
-    int n = rl.udp.read(dg, sizeof(dg));
+    uint16_t n = rl.w5500.read(dg, sizeof(dg));
     if (n < 4) continue;                       // need at least type_full + recv3
 
     const uint8_t typeFull = dg[0];
     if ((typeFull & 0x80) != 0x00) continue;   // only M2N (DIR_M2N bit7 clear)
 
     // Learn the host endpoint for replies.
-    rl.hostIp   = rl.udp.remoteIP();
-    rl.hostPort = rl.udp.remotePort();
+    rl.w5500.remoteIP(rl.hostIp);
+    rl.hostPort = rl.w5500.remotePort();
     rl.hostKnown = true;
 
     const uint8_t bodyLen = (uint8_t)(n - 4);
@@ -285,9 +291,6 @@ inline void service(Core& rl, const Callbacks& cb) {
 
     if (cb.onRxPacket) cb.onRxPacket(frame, flen, 0, 0, cb.ctx);
   }
-
-  // Keep the DHCP lease alive (Wiznet driver housekeeping).
-  Ethernet.maintain();
 }
 
 } // namespace RaceLinkTransport

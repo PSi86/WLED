@@ -1,7 +1,14 @@
 #pragma once
 
 #include "wled.h"
-#include "racelink_transport_core.h"
+// Transport backend selector: Ethernet (W5500/UDP) when built with
+// -D RACELINK_ETH, otherwise the LoRa/RadioLib backend. Both expose the same
+// RaceLinkTransport:: surface, so the rest of the usermod is medium-agnostic.
+#if defined(RACELINK_ETH)
+  #include "racelink_transport_eth.h"
+#else
+  #include "racelink_transport_core.h"
+#endif
 #include "racelink_headless.h"
 #include "racelink_indicators.h"
 //#include "racelink_proto.h"
@@ -326,7 +333,9 @@ private:
 
   // Radio / SPI
   SPIClass* spi = &SPI;
-  #if defined(RACELINK_SX1262)
+  #if defined(RACELINK_ETH)
+    // No radio on Ethernet builds; readiness is tracked via radioReady.
+  #elif defined(RACELINK_SX1262)
     SX1262* radio = nullptr;
   #elif defined(RACELINK_LLCC68)
     LLCC68* radio = nullptr;
