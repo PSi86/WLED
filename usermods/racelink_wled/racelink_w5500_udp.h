@@ -66,13 +66,12 @@ static constexpr uint8_t PHYCFGR_LINK = 0x01;        // 1 = link up
 
 class Driver {
 public:
-  // Bring up the chip: HW reset, SPI bus, MAC + static network config, and open
-  // socket 0 as a UDP listener on `port`. Returns true if the chip is detected
-  // (VERSIONR==0x04) and the socket reaches the UDP state.
+  // Bring the chip up: HW reset, SPI bus, software reset, chip detect, set the
+  // source MAC and socket-0 buffer sizes. Does NOT assign an IP or open a socket
+  // (call setStaticIp()/dhcpConfigure() then udpOpen()). Returns true if a W5500
+  // is detected (VERSIONR == 0x04).
   bool begin(SPIClass& spi, int8_t sck, int8_t miso, int8_t mosi, int8_t cs,
-             int8_t rst, const uint8_t mac6[6],
-             const uint8_t ip[4], const uint8_t subnet[4], const uint8_t gw[4],
-             uint16_t port) {
+             int8_t rst, const uint8_t mac6[6]) {
     _spi = &spi;
     _cs  = cs;
 
@@ -94,22 +93,25 @@ public:
 
     if (readReg8(BSB_COMMON, REG_VERSIONR) != 0x04) return false;  // not a W5500
 
-    // Static network identity.
-    writeBuf(BSB_COMMON, REG_SHAR, mac6, 6);
-    writeBuf(BSB_COMMON, REG_SIPR, ip, 4);
-    writeBuf(BSB_COMMON, REG_SUBR, subnet, 4);
-    writeBuf(BSB_COMMON, REG_GAR, gw, 4);
+    writeBuf(BSB_COMMON, REG_SHAR, mac6, 6);            // source MAC
 
     // 2KB TX/RX buffers for socket 0 (default; other sockets unused).
     writeReg8(BSB_S0_REG, Sn_RXBUF_SIZE, 2);
     writeReg8(BSB_S0_REG, Sn_TXBUF_SIZE, 2);
+    return true;
+  }
 
-    return udpOpen(port);
+  // Apply a static IP / subnet / gateway to the chip.
+  void setStaticIp(const uint8_t ip[4], const uint8_t subnet[4], const uint8_t gw[4]) {
+    writeBuf(BSB_COMMON, REG_SIPR, ip, 4);
+    writeBuf(BSB_COMMON, REG_SUBR, subnet, 4);
+    writeBuf(BSB_COMMON, REG_GAR, gw, 4);
   }
 
   // (Re)open socket 0 in UDP mode on `port`.
   bool udpOpen(uint16_t port) {
     _port = port;
+    _pendingLen = 0;                                   // drop any stale RX state
     writeReg8(BSB_S0_REG, Sn_MR, Sn_MR_UDP);           // UDP, broadcast RX enabled
     writeReg16(BSB_S0_REG, Sn_PORT, port);
     sockCmd(Sn_CR_OPEN);
@@ -118,6 +120,65 @@ public:
       delay(1);
     }
     return false;
+  }
+
+  // -------------------- DHCP client ------------------------------------------
+  // Obtain an IP lease over socket 0 (DISCOVER -> OFFER -> REQUEST -> ACK) and
+  // apply it (SIPR/SUBR/GAR). Returns true on success, filling out{Ip,Subnet,Gw}.
+  // Socket 0 is left closed; the caller opens the application port via udpOpen().
+  // Static-IP fallback is the caller's choice. Blocking up to ~timeoutMs.
+  bool dhcpConfigure(const uint8_t mac[6], uint8_t outIp[4], uint8_t outSubnet[4],
+                     uint8_t outGw[4], uint32_t timeoutMs = 12000) {
+    static const uint8_t kZero[4]  = {0, 0, 0, 0};
+    static const uint8_t kBcast[4] = {255, 255, 255, 255};
+    setStaticIp(kZero, kZero, kZero);                  // source IP 0.0.0.0 for DHCP
+    if (!udpOpen(68)) return false;
+
+    const uint32_t xid = ((uint32_t)millis() << 16) ^ (uint32_t)micros() ^ 0x524C0000u;
+    uint8_t  tx[300];
+    uint8_t  yi[4] = {0}, srv[4] = {0}, sub[4] = {0}, rtr[4] = {0};
+
+    const uint32_t start = millis();
+    bool offered = false;
+    while (!offered && (millis() - start) < timeoutMs) {
+      sendTo(kBcast, 67, tx, buildDhcp(tx, mac, xid, 1 /*DISCOVER*/, nullptr, nullptr));
+      const uint32_t t0 = millis();
+      while ((millis() - t0) < 2500) {
+        if (parsePacket()) {
+          uint8_t rx[576];
+          uint16_t n = read(rx, sizeof(rx));
+          if (parseDhcp(rx, n, xid, yi, srv, sub, rtr) == 2 /*OFFER*/) { offered = true; break; }
+        }
+        delay(5);
+      }
+    }
+    if (!offered) { sockCmd(Sn_CR_CLOSE); return false; }
+
+    bool acked = false;
+    const uint32_t reqStart = millis();
+    while (!acked && (millis() - reqStart) < timeoutMs) {
+      sendTo(kBcast, 67, tx, buildDhcp(tx, mac, xid, 3 /*REQUEST*/, yi, srv));
+      const uint32_t t0 = millis();
+      while ((millis() - t0) < 2500) {
+        if (parsePacket()) {
+          uint8_t rx[576];
+          uint16_t n = read(rx, sizeof(rx));
+          uint8_t mt = parseDhcp(rx, n, xid, yi, srv, sub, rtr);
+          if (mt == 5 /*ACK*/) { acked = true; break; }
+          if (mt == 6 /*NAK*/) { sockCmd(Sn_CR_CLOSE); return false; }
+        }
+        delay(5);
+      }
+    }
+    sockCmd(Sn_CR_CLOSE);
+    if (!acked) return false;
+
+    if (sub[0] == 0 && sub[1] == 0 && sub[2] == 0 && sub[3] == 0) {
+      sub[0] = 255; sub[1] = 255; sub[2] = 255; sub[3] = 0;   // sane default mask
+    }
+    setStaticIp(yi, sub, rtr);
+    for (int i = 0; i < 4; ++i) { outIp[i] = yi[i]; outSubnet[i] = sub[i]; outGw[i] = rtr[i]; }
+    return true;
   }
 
   bool linkUp() { return (readReg8(BSB_COMMON, REG_PHYCFGR) & PHYCFGR_LINK) != 0; }
@@ -244,6 +305,62 @@ private:
   void sockCmd(uint8_t cmd) {
     writeReg8(BSB_S0_REG, Sn_CR, cmd);
     while (readReg8(BSB_S0_REG, Sn_CR) != 0) { /* W5500 clears CR when accepted */ }
+  }
+
+  // -------------------- DHCP message build/parse -----------------------------
+  // Build a BOOTP/DHCP message (op=BOOTREQUEST). msgType: 1=DISCOVER, 3=REQUEST.
+  // For REQUEST, reqIp (option 50) and serverId (option 54) are appended.
+  // Returns the total length (padded to >= 300).
+  static uint16_t buildDhcp(uint8_t* b, const uint8_t mac[6], uint32_t xid,
+                            uint8_t msgType, const uint8_t* reqIp, const uint8_t* serverId) {
+    memset(b, 0, 240);
+    b[0] = 0x01;                 // op = BOOTREQUEST
+    b[1] = 0x01;                 // htype = ethernet
+    b[2] = 0x06;                 // hlen = 6
+    b[4] = (uint8_t)(xid >> 24); b[5] = (uint8_t)(xid >> 16);
+    b[6] = (uint8_t)(xid >> 8);  b[7] = (uint8_t)xid;
+    b[10] = 0x80;                // flags = 0x8000 (broadcast reply)
+    for (int i = 0; i < 6; ++i) b[28 + i] = mac[i];     // chaddr
+    b[236] = 0x63; b[237] = 0x82; b[238] = 0x53; b[239] = 0x63;  // magic cookie
+    uint16_t o = 240;
+    b[o++] = 53; b[o++] = 1; b[o++] = msgType;          // DHCP message type
+    if (msgType == 3) {                                  // REQUEST extras
+      if (reqIp)    { b[o++] = 50; b[o++] = 4; for (int i = 0; i < 4; ++i) b[o++] = reqIp[i]; }
+      if (serverId) { b[o++] = 54; b[o++] = 4; for (int i = 0; i < 4; ++i) b[o++] = serverId[i]; }
+    }
+    b[o++] = 55; b[o++] = 4; b[o++] = 1; b[o++] = 3; b[o++] = 6; b[o++] = 51;  // param request
+    b[o++] = 61; b[o++] = 7; b[o++] = 1; for (int i = 0; i < 6; ++i) b[o++] = mac[i];  // client id
+    b[o++] = 255;                                        // end
+    while (o < 300) b[o++] = 0;                          // min BOOTP length
+    return o;
+  }
+
+  // Parse a DHCP reply. Returns the message type (option 53), or 0 if invalid /
+  // xid mismatch. Fills yi (yiaddr) always; serverId/subnet/router if present.
+  static uint8_t parseDhcp(const uint8_t* b, uint16_t len, uint32_t xid,
+                           uint8_t yi[4], uint8_t serverId[4], uint8_t subnet[4], uint8_t router[4]) {
+    if (len < 240) return 0;
+    uint32_t rxid = ((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) | ((uint32_t)b[6] << 8) | b[7];
+    if (rxid != xid) return 0;
+    if (!(b[236] == 0x63 && b[237] == 0x82 && b[238] == 0x53 && b[239] == 0x63)) return 0;
+    for (int i = 0; i < 4; ++i) yi[i] = b[16 + i];      // yiaddr
+    uint8_t msgType = 0;
+    uint16_t o = 240;
+    while (o < len) {
+      uint8_t code = b[o++];
+      if (code == 0) continue;                           // pad
+      if (code == 255 || o >= len) break;                // end
+      uint8_t l = b[o++];
+      if ((uint16_t)(o + l) > len) break;
+      switch (code) {
+        case 53: if (l >= 1) msgType = b[o]; break;
+        case 54: if (l >= 4 && serverId) for (int i = 0; i < 4; ++i) serverId[i] = b[o + i]; break;
+        case 1:  if (l >= 4 && subnet)   for (int i = 0; i < 4; ++i) subnet[i]   = b[o + i]; break;
+        case 3:  if (l >= 4 && router)   for (int i = 0; i < 4; ++i) router[i]   = b[o + i]; break;
+      }
+      o += l;
+    }
+    return msgType;
   }
 };
 

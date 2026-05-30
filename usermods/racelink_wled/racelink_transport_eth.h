@@ -65,8 +65,13 @@
 #ifndef RACELINK_ETH_HOST_PORT
   #define RACELINK_ETH_HOST_PORT 5079
 #endif
-// Static IP config (PoC; DHCP is a later add). Override per build profile.
-// Each macro expands to a comma-separated octet list, e.g. -D RACELINK_ETH_IP=192,168,1,177
+// DHCP on by default; set -D RACELINK_ETH_DHCP=0 to use the static IP below.
+#ifndef RACELINK_ETH_DHCP
+  #define RACELINK_ETH_DHCP 1
+#endif
+// Static IP config: used when DHCP is disabled, or as a fallback if a lease
+// fails. Override per build profile. Each macro expands to a comma-separated
+// octet list, e.g. -D RACELINK_ETH_IP=192,168,1,177
 #ifndef RACELINK_ETH_IP
   #define RACELINK_ETH_IP 192,168,1,177
 #endif
@@ -126,6 +131,10 @@ struct Core {
   uint16_t hostPort   = RACELINK_ETH_HOST_PORT;
   bool     hostKnown  = false;
   bool     linkUp     = false;
+  bool     dhcpOk     = false;      // true if a DHCP lease was obtained
+  uint8_t  ip[4]      = {0};        // own IP (DHCP lease or static)
+  uint8_t  subnet[4]  = {0};
+  uint8_t  gateway[4] = {0};
 
   // --- TX state (fire-and-forget: never actually pending) ---
   bool     txPending  = false;
@@ -198,16 +207,31 @@ inline bool beginCommon(Core& rl, const EthCfg& cfg = EthCfg{}) {
   }
   mac[0] = (uint8_t)((mac[0] & 0xFE) | 0x02);  // unicast + locally administered
 
-  const uint8_t ip[4]     = { RACELINK_ETH_IP };
-  const uint8_t subnet[4] = { RACELINK_ETH_SUBNET };
-  const uint8_t gw[4]     = { RACELINK_ETH_GATEWAY };
+  const uint8_t staticIp[4]     = { RACELINK_ETH_IP };
+  const uint8_t staticSubnet[4] = { RACELINK_ETH_SUBNET };
+  const uint8_t staticGw[4]     = { RACELINK_ETH_GATEWAY };
 
-  if (!rl.w5500.begin(SPI, cfg.sclk, cfg.miso, cfg.mosi, cfg.cs, cfg.rst,
-                      mac, ip, subnet, gw, rl.nodePort)) {
+  // Chip bring-up (HW reset, SPI, MAC). No IP / socket yet.
+  if (!rl.w5500.begin(SPI, cfg.sclk, cfg.miso, cfg.mosi, cfg.cs, cfg.rst, mac)) {
     rl.linkUp = false;
     return false;
   }
-  rl.linkUp = rl.w5500.linkUp();   // link may still be negotiating; socket is open
+  rl.linkUp = rl.w5500.linkUp();   // may still be negotiating
+
+  // Network config: DHCP (default) with static fallback, or static when disabled.
+#if RACELINK_ETH_DHCP
+  rl.dhcpOk = rl.w5500.dhcpConfigure(mac, rl.ip, rl.subnet, rl.gateway);
+  if (!rl.dhcpOk) {
+    rl.w5500.setStaticIp(staticIp, staticSubnet, staticGw);
+    for (int i = 0; i < 4; ++i) { rl.ip[i] = staticIp[i]; rl.subnet[i] = staticSubnet[i]; rl.gateway[i] = staticGw[i]; }
+  }
+#else
+  rl.w5500.setStaticIp(staticIp, staticSubnet, staticGw);
+  for (int i = 0; i < 4; ++i) { rl.ip[i] = staticIp[i]; rl.subnet[i] = staticSubnet[i]; rl.gateway[i] = staticGw[i]; }
+#endif
+
+  // Open the application UDP socket (broadcast-capable for OPC_DEVICES discovery).
+  if (!rl.w5500.udpOpen(rl.nodePort)) return false;
   return true;
 }
 
