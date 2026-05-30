@@ -93,6 +93,7 @@ public:
 
     if (readReg8(BSB_COMMON, REG_VERSIONR) != 0x04) return false;  // not a W5500
 
+    for (int i = 0; i < 6; ++i) _mac[i] = mac6[i];     // kept for DHCP rebuilds
     writeBuf(BSB_COMMON, REG_SHAR, mac6, 6);            // source MAC
 
     // 2KB TX/RX buffers for socket 0 (default; other sockets unused).
@@ -122,63 +123,75 @@ public:
     return false;
   }
 
-  // -------------------- DHCP client ------------------------------------------
-  // Obtain an IP lease over socket 0 (DISCOVER -> OFFER -> REQUEST -> ACK) and
-  // apply it (SIPR/SUBR/GAR). Returns true on success, filling out{Ip,Subnet,Gw}.
-  // Socket 0 is left closed; the caller opens the application port via udpOpen().
-  // Static-IP fallback is the caller's choice. Blocking up to ~timeoutMs.
-  bool dhcpConfigure(const uint8_t mac[6], uint8_t outIp[4], uint8_t outSubnet[4],
-                     uint8_t outGw[4], uint32_t timeoutMs = 12000) {
-    static const uint8_t kZero[4]  = {0, 0, 0, 0};
-    static const uint8_t kBcast[4] = {255, 255, 255, 255};
-    setStaticIp(kZero, kZero, kZero);                  // source IP 0.0.0.0 for DHCP
-    if (!udpOpen(68)) return false;
+  // -------------------- DHCP client (non-blocking state machine) -------------
+  // Usage: dhcpBegin() once, then call dhcpPoll() every loop until it returns
+  // Bound (lease acquired, SIPR/SUBR/GAR applied, socket 0 closed -> caller opens
+  // the app port via udpOpen() and reads the lease via dhcpResult()) or Failed
+  // (overall timeout -> caller applies a static fallback).
+  enum class DhcpState : uint8_t { Idle, Discover, Request, Bound, Failed };
 
-    const uint32_t xid = ((uint32_t)millis() << 16) ^ (uint32_t)micros() ^ 0x524C0000u;
-    uint8_t  tx[300];
-    uint8_t  yi[4] = {0}, srv[4] = {0}, sub[4] = {0}, rtr[4] = {0};
+  // Kick off DHCP: source IP 0.0.0.0, open socket 0 on port 68, send DISCOVER.
+  void dhcpBegin(uint32_t totalTimeoutMs = 16000) {
+    static const uint8_t kZero[4] = {0, 0, 0, 0};
+    setStaticIp(kZero, kZero, kZero);
+    for (int i = 0; i < 4; ++i) { _yi[i] = _srv[i] = _sub[i] = _rtr[i] = 0; }
+    _dhcpTimeout = totalTimeoutMs;
+    _dhcpStart   = millis();
+    _xid         = ((uint32_t)millis() << 16) ^ (uint32_t)micros() ^ 0x524C0000u;
+    if (!udpOpen(68)) { _dhcpState = DhcpState::Failed; return; }
+    dhcpSend(1 /*DISCOVER*/);
+    _dhcpState = DhcpState::Discover;
+  }
 
-    const uint32_t start = millis();
-    bool offered = false;
-    while (!offered && (millis() - start) < timeoutMs) {
-      sendTo(kBcast, 67, tx, buildDhcp(tx, mac, xid, 1 /*DISCOVER*/, nullptr, nullptr));
-      const uint32_t t0 = millis();
-      while ((millis() - t0) < 2500) {
-        if (parsePacket()) {
-          uint8_t rx[576];
-          uint16_t n = read(rx, sizeof(rx));
-          if (parseDhcp(rx, n, xid, yi, srv, sub, rtr) == 2 /*OFFER*/) { offered = true; break; }
+  // Advance the DHCP state machine. Non-blocking: does at most one RX read +
+  // retransmit per call. Returns the current state.
+  DhcpState dhcpPoll() {
+    if (_dhcpState == DhcpState::Bound || _dhcpState == DhcpState::Failed ||
+        _dhcpState == DhcpState::Idle) {
+      return _dhcpState;
+    }
+    const uint32_t now = millis();
+    if ((now - _dhcpStart) > _dhcpTimeout) {             // overall timeout
+      sockCmd(Sn_CR_CLOSE);
+      _dhcpState = DhcpState::Failed;
+      return _dhcpState;
+    }
+
+    if (parsePacket()) {
+      uint8_t rx[576];
+      uint16_t n = read(rx, sizeof(rx));
+      uint8_t mt = parseDhcp(rx, n, _xid, _yi, _srv, _sub, _rtr);
+      if (_dhcpState == DhcpState::Discover && mt == 2 /*OFFER*/) {
+        dhcpSend(3 /*REQUEST*/);
+        _dhcpState = DhcpState::Request;
+        return _dhcpState;
+      }
+      if (_dhcpState == DhcpState::Request && mt == 5 /*ACK*/) {
+        if (_sub[0] == 0 && _sub[1] == 0 && _sub[2] == 0 && _sub[3] == 0) {
+          _sub[0] = 255; _sub[1] = 255; _sub[2] = 255; _sub[3] = 0;  // sane mask
         }
-        delay(5);
+        setStaticIp(_yi, _sub, _rtr);
+        sockCmd(Sn_CR_CLOSE);
+        _dhcpState = DhcpState::Bound;
+        return _dhcpState;
+      }
+      if (mt == 6 /*NAK*/) {                              // restart discovery
+        dhcpSend(1 /*DISCOVER*/);
+        _dhcpState = DhcpState::Discover;
+        _dhcpLastSend = now;
+        return _dhcpState;
       }
     }
-    if (!offered) { sockCmd(Sn_CR_CLOSE); return false; }
 
-    bool acked = false;
-    const uint32_t reqStart = millis();
-    while (!acked && (millis() - reqStart) < timeoutMs) {
-      sendTo(kBcast, 67, tx, buildDhcp(tx, mac, xid, 3 /*REQUEST*/, yi, srv));
-      const uint32_t t0 = millis();
-      while ((millis() - t0) < 2500) {
-        if (parsePacket()) {
-          uint8_t rx[576];
-          uint16_t n = read(rx, sizeof(rx));
-          uint8_t mt = parseDhcp(rx, n, xid, yi, srv, sub, rtr);
-          if (mt == 5 /*ACK*/) { acked = true; break; }
-          if (mt == 6 /*NAK*/) { sockCmd(Sn_CR_CLOSE); return false; }
-        }
-        delay(5);
-      }
+    if ((now - _dhcpLastSend) > 3000) {                  // retransmit
+      dhcpSend(_dhcpState == DhcpState::Request ? 3 : 1);
     }
-    sockCmd(Sn_CR_CLOSE);
-    if (!acked) return false;
+    return _dhcpState;
+  }
 
-    if (sub[0] == 0 && sub[1] == 0 && sub[2] == 0 && sub[3] == 0) {
-      sub[0] = 255; sub[1] = 255; sub[2] = 255; sub[3] = 0;   // sane default mask
-    }
-    setStaticIp(yi, sub, rtr);
-    for (int i = 0; i < 4; ++i) { outIp[i] = yi[i]; outSubnet[i] = sub[i]; outGw[i] = rtr[i]; }
-    return true;
+  // Copy the acquired lease (valid once dhcpPoll() returned Bound).
+  void dhcpResult(uint8_t outIp[4], uint8_t outSubnet[4], uint8_t outGw[4]) const {
+    for (int i = 0; i < 4; ++i) { outIp[i] = _yi[i]; outSubnet[i] = _sub[i]; outGw[i] = _rtr[i]; }
   }
 
   bool linkUp() { return (readReg8(BSB_COMMON, REG_PHYCFGR) & PHYCFGR_LINK) != 0; }
@@ -250,6 +263,25 @@ private:
   uint16_t  _srcPort = 0;
   uint16_t  _pendingLen = 0;   // payload bytes of the parsed-but-unread datagram
   uint16_t  _rxRd = 0;         // RX read pointer at the payload start
+
+  // DHCP state-machine fields.
+  uint8_t   _mac[6]      = {0};
+  DhcpState _dhcpState   = DhcpState::Idle;
+  uint32_t  _xid         = 0;
+  uint32_t  _dhcpStart   = 0;
+  uint32_t  _dhcpLastSend = 0;
+  uint32_t  _dhcpTimeout = 16000;
+  uint8_t   _yi[4] = {0}, _srv[4] = {0}, _sub[4] = {0}, _rtr[4] = {0};
+
+  // Build + broadcast a DHCP DISCOVER (msgType 1) or REQUEST (3).
+  void dhcpSend(uint8_t msgType) {
+    static const uint8_t kBcast[4] = {255, 255, 255, 255};
+    uint8_t tx[300];
+    const uint8_t* reqIp = (msgType == 3) ? _yi  : nullptr;
+    const uint8_t* srv   = (msgType == 3) ? _srv : nullptr;
+    sendTo(kBcast, 67, tx, buildDhcp(tx, _mac, _xid, msgType, reqIp, srv));
+    _dhcpLastSend = millis();
+  }
 
   // SPI clock for the W5500 (datasheet allows up to ~80MHz; 16MHz is safe).
   static constexpr uint32_t kSpiHz = 16000000UL;

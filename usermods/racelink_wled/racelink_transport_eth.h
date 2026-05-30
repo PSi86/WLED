@@ -131,6 +131,7 @@ struct Core {
   uint16_t hostPort   = RACELINK_ETH_HOST_PORT;
   bool     hostKnown  = false;
   bool     linkUp     = false;
+  bool     netReady   = false;      // app UDP socket bound (DHCP done or static)
   bool     dhcpOk     = false;      // true if a DHCP lease was obtained
   uint8_t  ip[4]      = {0};        // own IP (DHCP lease or static)
   uint8_t  subnet[4]  = {0};
@@ -218,20 +219,18 @@ inline bool beginCommon(Core& rl, const EthCfg& cfg = EthCfg{}) {
   }
   rl.linkUp = rl.w5500.linkUp();   // may still be negotiating
 
-  // Network config: DHCP (default) with static fallback, or static when disabled.
+  // Network config. DHCP runs non-blocking (kicked off here, driven to
+  // completion in service()); static comes up immediately. radioReady becomes
+  // true regardless -- service() gates real RX/TX on rl.netReady.
 #if RACELINK_ETH_DHCP
-  rl.dhcpOk = rl.w5500.dhcpConfigure(mac, rl.ip, rl.subnet, rl.gateway);
-  if (!rl.dhcpOk) {
-    rl.w5500.setStaticIp(staticIp, staticSubnet, staticGw);
-    for (int i = 0; i < 4; ++i) { rl.ip[i] = staticIp[i]; rl.subnet[i] = staticSubnet[i]; rl.gateway[i] = staticGw[i]; }
-  }
+  rl.w5500.dhcpBegin();              // socket 0 -> port 68; service() finishes it
+  rl.netReady = false;
 #else
   rl.w5500.setStaticIp(staticIp, staticSubnet, staticGw);
   for (int i = 0; i < 4; ++i) { rl.ip[i] = staticIp[i]; rl.subnet[i] = staticSubnet[i]; rl.gateway[i] = staticGw[i]; }
-#endif
-
-  // Open the application UDP socket (broadcast-capable for OPC_DEVICES discovery).
   if (!rl.w5500.udpOpen(rl.nodePort)) return false;
+  rl.netReady = true;
+#endif
   return true;
 }
 
@@ -246,6 +245,7 @@ inline void setDefaultRxContinuous(Core& /*rl*/) {}
 // as RaceLinkProto::build() produced it; the host expects [type_byte] prepended.
 // jitterMaxMs is ignored (no LBT/CAD on a wired medium).
 inline bool scheduleSend(Core& rl, const uint8_t* buf, uint8_t len, uint16_t /*jitterMaxMs*/ = 0) {
+  if (!rl.netReady) return false;            // network not up yet (DHCP pending)
   if (!buf || len < (uint8_t)sizeof(RaceLinkProto::Header7)) return false;
 
   // N2M datagram = [type_byte] ++ (Header7 + body), where type_byte = Header7.type.
@@ -269,6 +269,27 @@ inline bool scheduleSend(Core& rl, const uint8_t* buf, uint8_t len, uint16_t /*j
 // each one to cb.onRxPacket() as a reconstructed Header7 frame so the usermod's
 // handlePacket()/receiverMatches() path runs unchanged.
 inline void service(Core& rl, const Callbacks& cb) {
+  // Until the network is up, drive the non-blocking DHCP state machine. Once a
+  // lease binds (or DHCP times out -> static fallback), open the app UDP socket.
+  if (!rl.netReady) {
+    const RaceLinkW5500::Driver::DhcpState st = rl.w5500.dhcpPoll();
+    if (st == RaceLinkW5500::Driver::DhcpState::Bound) {
+      rl.w5500.dhcpResult(rl.ip, rl.subnet, rl.gateway);
+      rl.dhcpOk = true;
+    } else if (st == RaceLinkW5500::Driver::DhcpState::Failed) {
+      const uint8_t sIp[4] = { RACELINK_ETH_IP };
+      const uint8_t sSub[4] = { RACELINK_ETH_SUBNET };
+      const uint8_t sGw[4] = { RACELINK_ETH_GATEWAY };
+      rl.w5500.setStaticIp(sIp, sSub, sGw);
+      for (int i = 0; i < 4; ++i) { rl.ip[i] = sIp[i]; rl.subnet[i] = sSub[i]; rl.gateway[i] = sGw[i]; }
+      rl.dhcpOk = false;
+    } else {
+      return;                                  // still negotiating
+    }
+    if (!rl.w5500.udpOpen(rl.nodePort)) return; // try again next tick on failure
+    rl.netReady = true;
+  }
+
   // parsePacket() reports the next datagram's payload size; read() must follow to
   // advance the W5500 RX pointer, so read() is called once per iteration before
   // any `continue`.
