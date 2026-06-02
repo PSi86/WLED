@@ -1990,6 +1990,14 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
     } break;
 
     case OPC_RF_CONFIG: { // Write LoRa PHY config (12 B P_RfConfig)
+#if defined(RACELINK_ETH)
+      // No LoRa PHY on Ethernet builds — reject (unicast) so the node never
+      // reboots onto a meaningless config. The host's EthernetTransport does
+      // not send OPC_RF_CONFIG to Ethernet nodes.
+      if (!RaceLinkTransport::isBroadcast3(h.receiver))
+        sendAckTo(h.sender, OPC_RF_CONFIG, ACK_BAD_TYPE);
+      break;
+#else
       // Unicast-only by design: a broadcast OPC_RF_CONFIG would knock
       // every reachable node off-channel simultaneously and brick the
       // fleet. The wire-level rule lives in racelink_proto.h; we
@@ -2061,9 +2069,16 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
       delay(50);
       ESP.restart();
       // not reached
+#endif // !RACELINK_ETH
     } break;
 
     case OPC_GET_RF_CONFIG: { // Read-back of the active PHY config
+#if defined(RACELINK_ETH)
+      // No persisted PHY config on Ethernet builds — reject (unicast).
+      if (!RaceLinkTransport::isBroadcast3(h.receiver))
+        sendAckTo(h.sender, OPC_GET_RF_CONFIG, ACK_BAD_TYPE);
+      break;
+#else
       if (RaceLinkTransport::isBroadcast3(h.receiver)) {
         // Unicast-only: a broadcast read-back would have every node
         // reply simultaneously and saturate the channel.
@@ -2080,6 +2095,7 @@ void UsermodRaceLink::handlePacket(const uint8_t* buf, size_t len) {
       sendRfConfigReplyTo(h.sender);
       acted = true;
       DEBUG_PRINTLN(F("[RaceLink] GET_RF_CONFIG -> reply sent"));
+#endif // !RACELINK_ETH
     } break;
   }
 

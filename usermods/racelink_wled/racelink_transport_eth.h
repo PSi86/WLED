@@ -130,7 +130,8 @@ struct Core {
   uint8_t  hostIp[4]  = {0};        // learned host endpoint (reply target)
   uint16_t hostPort   = RACELINK_ETH_HOST_PORT;
   bool     hostKnown  = false;
-  bool     linkUp     = false;
+  bool     linkUp     = false;      // live PHY link (refreshed in service())
+  uint32_t lastLinkPollMs = 0;      // throttle for the PHYCFGR link read
   bool     netReady   = false;      // app UDP socket bound (DHCP done or static)
   bool     dhcpOk     = false;      // true if a DHCP lease was obtained
   uint8_t  ip[4]      = {0};        // own IP (DHCP lease or static)
@@ -269,6 +270,17 @@ inline bool scheduleSend(Core& rl, const uint8_t* buf, uint8_t len, uint16_t /*j
 // each one to cb.onRxPacket() as a reconstructed Header7 frame so the usermod's
 // handlePacket()/receiverMatches() path runs unchanged.
 inline void service(Core& rl, const Callbacks& cb) {
+  // Refresh the live PHY link state (throttled). beginCommon() reads it once
+  // right after reset, before auto-negotiation finishes, so without this the
+  // cached value would stay "down" even after the link comes up.
+  {
+    const uint32_t now = millis();
+    if (now - rl.lastLinkPollMs >= 500) {
+      rl.lastLinkPollMs = now;
+      rl.linkUp = rl.w5500.linkUp();
+    }
+  }
+
   // Until the network is up, drive the non-blocking DHCP state machine. Once a
   // lease binds (or DHCP times out -> static fallback), open the app UDP socket.
   if (!rl.netReady) {
