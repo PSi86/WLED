@@ -355,6 +355,18 @@ private:
   int8_t pinBusy = RACELINK_PIN_BUSY;
   int8_t pinRst  = RACELINK_PIN_RST;
 
+  #if defined(RACELINK_ETH)
+  // W5500 SPI pins — runtime-configurable in the usermod settings, exactly like
+  // the LoRa radio pins above. A change in the UI sets doReboot; the W5500 is
+  // re-init'd at boot with the saved values (build-flag macros are the defaults).
+  int8_t ethSclk = RACELINK_ETH_SCLK;
+  int8_t ethMosi = RACELINK_ETH_MOSI;
+  int8_t ethMiso = RACELINK_ETH_MISO;
+  int8_t ethCs   = RACELINK_ETH_CS;
+  int8_t ethRst  = RACELINK_ETH_RST;
+  int8_t ethInt  = RACELINK_ETH_INT;
+  #endif
+
   #ifdef RACELINK_EPAPER
     // ePaper SPI bus + control pins. CS/DC/RST/BUSY are written into the
     // GxEPD2 display object during epaperInit(); SCK/MISO/MOSI configure

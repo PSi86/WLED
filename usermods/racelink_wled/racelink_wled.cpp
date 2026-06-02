@@ -321,10 +321,9 @@ void UsermodRaceLink::addToJsonInfo(JsonObject& root) {
   {
     char p[12]; snprintf(p, sizeof(p), "%u", (unsigned)rl.nodePort);
     user.createNestedArray(F("ETH UDP Port")).add(p);
-    char pinmap[40];
-    snprintf(pinmap, sizeof(pinmap), "CS%d RST%d SCK%d MI%d MO%d",
-             RACELINK_ETH_CS, RACELINK_ETH_RST, RACELINK_ETH_SCLK,
-             RACELINK_ETH_MISO, RACELINK_ETH_MOSI);
+    char pinmap[48];
+    snprintf(pinmap, sizeof(pinmap), "CS%d RST%d SCK%d MI%d MO%d INT%d",
+             ethCs, ethRst, ethSclk, ethMiso, ethMosi, ethInt);
     user.createNestedArray(F("ETH W5500 Pins")).add(pinmap);
   }
 #else
@@ -557,9 +556,17 @@ void UsermodRaceLink::addToConfig(JsonObject& root) {
   pins[F("BUSY")] = pinBusy;
   pins[F("RST")]  = pinRst;
 #else
-  // Ethernet (W5500) builds: the SPI pins, UDP ports and DHCP/static IP mode are
-  // compile-time (RACELINK_ETH_* build flags) and shown read-only in Info.
-  // The live link/IP state is reported in addToJsonInfo().
+  // Ethernet (W5500) builds: the SPI pins are runtime-configurable here, exactly
+  // like the LoRa radio pins. Saved values load into eth* members in
+  // readFromConfig() and apply when radioInit() runs at the next boot. (UDP
+  // ports and DHCP/static IP mode remain compile-time RACELINK_ETH_* build flags.)
+  JsonObject ethPins = top.createNestedObject("eth_pins");
+  ethPins[F("SCLK")] = ethSclk;
+  ethPins[F("MOSI")] = ethMosi;
+  ethPins[F("MISO")] = ethMiso;
+  ethPins[F("CS")]   = ethCs;
+  ethPins[F("RST")]  = ethRst;
+  ethPins[F("INT")]  = ethInt;
 #endif
 
   #ifdef RACELINK_EPAPER
@@ -755,6 +762,29 @@ bool UsermodRaceLink::readFromConfig(JsonObject& root) {
     doReboot = true;
   }
 #endif // !RACELINK_ETH
+
+#if defined(RACELINK_ETH)
+  // W5500 SPI pins (runtime-configurable, parity with the LoRa radio pins). A
+  // change requires a reboot to re-init SPI/Ethernet; suppressed on first boot.
+  const int8_t oldEthSclk = ethSclk, oldEthMosi = ethMosi, oldEthMiso = ethMiso,
+               oldEthCs = ethCs, oldEthRst = ethRst, oldEthInt = ethInt;
+  {
+    JsonObject ep = top["eth_pins"];
+    getJsonValue(ep[F("SCLK")], ethSclk, RACELINK_ETH_SCLK);
+    getJsonValue(ep[F("MOSI")], ethMosi, RACELINK_ETH_MOSI);
+    getJsonValue(ep[F("MISO")], ethMiso, RACELINK_ETH_MISO);
+    getJsonValue(ep[F("CS")],   ethCs,   RACELINK_ETH_CS);
+    getJsonValue(ep[F("RST")],  ethRst,  RACELINK_ETH_RST);
+    getJsonValue(ep[F("INT")],  ethInt,  RACELINK_ETH_INT);
+  }
+  const bool ethPinsChanged = (oldEthSclk != ethSclk) || (oldEthMosi != ethMosi) ||
+                              (oldEthMiso != ethMiso) || (oldEthCs   != ethCs)   ||
+                              (oldEthRst  != ethRst)  || (oldEthInt  != ethInt);
+  if (ethPinsChanged && !firstReadFromConfig) {
+    DEBUG_PRINTLN(F("[RaceLink] ETH pin config changed — rebooting to apply"));
+    doReboot = true;
+  }
+#endif
   firstReadFromConfig = false;
 
   // RaceLink-authoritative overrides. Slots are always present in cfg.json
@@ -865,12 +895,12 @@ bool UsermodRaceLink::radioInit() {
   // any of them fails loudly here instead of silently breaking the link. SCLK/
   // MOSI/CS/RST are driven (output); MISO and INT are inputs.
   const PinManagerPinType ethPins[] = {
-    { RACELINK_ETH_SCLK, true  },
-    { RACELINK_ETH_MOSI, true  },
-    { RACELINK_ETH_MISO, false },
-    { RACELINK_ETH_CS,   true  },
-    { RACELINK_ETH_RST,  true  },
-    { RACELINK_ETH_INT,  false },
+    { ethSclk, true  },
+    { ethMosi, true  },
+    { ethMiso, false },
+    { ethCs,   true  },
+    { ethRst,  true  },
+    { ethInt,  false },
   };
   if (!PinManager::allocateMultiplePins(ethPins, sizeof(ethPins) / sizeof(ethPins[0]),
                                         PinOwner::UM_Unspecified)) {
@@ -879,7 +909,13 @@ bool UsermodRaceLink::radioInit() {
     return false;
   }
 
-  radioInitCode = RaceLinkTransport::beginCommon(rl) ? 0 : -999;
+  // Bring up the W5500 on the runtime-configured pins (UI/cfg.json overrides the
+  // RACELINK_ETH_* build-flag defaults; node port stays compile-time).
+  RaceLinkTransport::EthCfg ethCfg;
+  ethCfg.sclk = ethSclk; ethCfg.mosi = ethMosi; ethCfg.miso = ethMiso;
+  ethCfg.cs = ethCs; ethCfg.rst = ethRst; ethCfg.irq = ethInt;
+  ethCfg.nodePort = RACELINK_ETH_NODE_PORT;
+  radioInitCode = RaceLinkTransport::beginCommon(rl, ethCfg) ? 0 : -999;
   if (radioInitCode != 0) return false;
   rl.lbtEnable = false;                            // no LBT on a wired medium
   RaceLinkTransport::setDefaultRxContinuous(rl);   // no-op on Ethernet
