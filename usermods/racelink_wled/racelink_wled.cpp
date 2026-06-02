@@ -317,14 +317,10 @@ void UsermodRaceLink::addToJsonInfo(JsonObject& root) {
     JsonArray row = user.createNestedArray(F("RaceLink ETH"));
     row.add(eth);
   }
-  // UDP node port + W5500 SPI pin map (build-time reference).
+  // UDP node port (the W5500 pins live in the usermod settings, not here).
   {
     char p[12]; snprintf(p, sizeof(p), "%u", (unsigned)rl.nodePort);
     user.createNestedArray(F("ETH UDP Port")).add(p);
-    char pinmap[48];
-    snprintf(pinmap, sizeof(pinmap), "CS%d RST%d SCK%d MI%d MO%d INT%d",
-             ethCs, ethRst, ethSclk, ethMiso, ethMosi, ethInt);
-    user.createNestedArray(F("ETH W5500 Pins")).add(pinmap);
   }
 #else
   // RaceLink Init (radio)
