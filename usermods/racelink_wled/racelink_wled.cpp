@@ -307,8 +307,9 @@ void UsermodRaceLink::addToJsonInfo(JsonObject& root) {
   {
     char eth[48];
     if (radioReady) {
+      // Read the PHY link state on demand (only when the info panel renders).
       snprintf(eth, sizeof(eth), "%s  %u.%u.%u.%u (%s)",
-               rl.linkUp ? "LINK UP" : "no link",
+               rl.w5500.linkUp() ? "LINK UP" : "no link",
                rl.ip[0], rl.ip[1], rl.ip[2], rl.ip[3],
                rl.dhcpOk ? "DHCP" : "static");
     } else {
