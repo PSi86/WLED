@@ -131,10 +131,15 @@ public:
   enum class DhcpState : uint8_t { Idle, Discover, Request, Bound, Failed };
 
   // Kick off DHCP: source IP 0.0.0.0, open socket 0 on port 68, send DISCOVER.
-  void dhcpBegin(uint32_t totalTimeoutMs = 16000) {
+  // `renew=true` marks this as a lease renewal (rebind) rather than the initial
+  // acquisition; the caller uses isRenewing() to keep the current IP on failure
+  // instead of dropping to a static fallback.
+  void dhcpBegin(bool renew = false, uint32_t totalTimeoutMs = 16000) {
     static const uint8_t kZero[4] = {0, 0, 0, 0};
     setStaticIp(kZero, kZero, kZero);
     for (int i = 0; i < 4; ++i) { _yi[i] = _srv[i] = _sub[i] = _rtr[i] = 0; }
+    _renewing    = renew;
+    _lastRenewMs = millis();
     _dhcpTimeout = totalTimeoutMs;
     _dhcpStart   = millis();
     _xid         = ((uint32_t)millis() << 16) ^ (uint32_t)micros() ^ 0x524C0000u;
@@ -142,6 +147,20 @@ public:
     dhcpSend(1 /*DISCOVER*/);
     _dhcpState = DhcpState::Discover;
   }
+
+  // True once a lease is held and ~85% of its lifetime has elapsed (so a renewal
+  // is due), throttled so a failing renewal doesn't re-broadcast every loop.
+  bool dhcpRenewDue() const {
+    if (_dhcpState != DhcpState::Bound || _leaseSec == 0) return false;
+    const uint32_t now = millis();
+    return (now - _boundAtMs) >= (_leaseSec * 850UL)   // 85% of lease (sec*1000*0.85)
+        && (now - _lastRenewMs) >= 30000UL;            // retry no more than ~2x/min
+  }
+  bool isRenewing() const { return _renewing; }
+
+  // After a failed renewal: keep treating the existing lease as held (so
+  // dhcpRenewDue() retries on the throttle) rather than staying in Failed.
+  void dhcpKeepLease() { _dhcpState = DhcpState::Bound; }
 
   // Advance the DHCP state machine. Non-blocking: does at most one RX read +
   // retransmit per call. Returns the current state.
@@ -160,7 +179,8 @@ public:
     if (parsePacket()) {
       uint8_t rx[576];
       uint16_t n = read(rx, sizeof(rx));
-      uint8_t mt = parseDhcp(rx, n, _xid, _yi, _srv, _sub, _rtr);
+      uint32_t lease = 0;
+      uint8_t mt = parseDhcp(rx, n, _xid, _yi, _srv, _sub, _rtr, lease);
       if (_dhcpState == DhcpState::Discover && mt == 2 /*OFFER*/) {
         dhcpSend(3 /*REQUEST*/);
         _dhcpState = DhcpState::Request;
@@ -172,6 +192,8 @@ public:
         }
         setStaticIp(_yi, _sub, _rtr);
         sockCmd(Sn_CR_CLOSE);
+        _leaseSec  = lease;        // 0 if the server omitted option 51
+        _boundAtMs = now;
         _dhcpState = DhcpState::Bound;
         return _dhcpState;
       }
@@ -272,6 +294,11 @@ private:
   uint32_t  _dhcpLastSend = 0;
   uint32_t  _dhcpTimeout = 16000;
   uint8_t   _yi[4] = {0}, _srv[4] = {0}, _sub[4] = {0}, _rtr[4] = {0};
+  // Lease renewal tracking.
+  uint32_t  _leaseSec    = 0;       // DHCP lease lifetime (option 51), seconds
+  uint32_t  _boundAtMs   = 0;       // millis() when the current lease bound
+  uint32_t  _lastRenewMs = 0;       // throttle for renewal attempts
+  bool      _renewing    = false;   // current DHCP run is a renewal, not initial
 
   // Build + broadcast a DHCP DISCOVER (msgType 1) or REQUEST (3).
   void dhcpSend(uint8_t msgType) {
@@ -368,9 +395,11 @@ private:
   }
 
   // Parse a DHCP reply. Returns the message type (option 53), or 0 if invalid /
-  // xid mismatch. Fills yi (yiaddr) always; serverId/subnet/router if present.
+  // xid mismatch. Fills yi (yiaddr) always; serverId/subnet/router/leaseSec if
+  // present (leaseSec from option 51, in seconds; 0 if absent).
   static uint8_t parseDhcp(const uint8_t* b, uint16_t len, uint32_t xid,
-                           uint8_t yi[4], uint8_t serverId[4], uint8_t subnet[4], uint8_t router[4]) {
+                           uint8_t yi[4], uint8_t serverId[4], uint8_t subnet[4],
+                           uint8_t router[4], uint32_t& leaseSec) {
     if (len < 240) return 0;
     uint32_t rxid = ((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) | ((uint32_t)b[6] << 8) | b[7];
     if (rxid != xid) return 0;
@@ -389,6 +418,8 @@ private:
         case 54: if (l >= 4 && serverId) for (int i = 0; i < 4; ++i) serverId[i] = b[o + i]; break;
         case 1:  if (l >= 4 && subnet)   for (int i = 0; i < 4; ++i) subnet[i]   = b[o + i]; break;
         case 3:  if (l >= 4 && router)   for (int i = 0; i < 4; ++i) router[i]   = b[o + i]; break;
+        case 51: if (l >= 4) leaseSec = ((uint32_t)b[o] << 24) | ((uint32_t)b[o+1] << 16)
+                                       | ((uint32_t)b[o+2] << 8) | b[o+3]; break;  // lease time
       }
       o += l;
     }

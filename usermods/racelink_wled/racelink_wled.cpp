@@ -860,8 +860,25 @@ bool UsermodRaceLink::radioInit() {
 #if defined(RACELINK_ETH)
   // Ethernet (W5500/UDP) bring-up. SPI pins, RST and the UDP node port come
   // from the RACELINK_ETH_* build flags (defaults in racelink_transport_eth.h).
-  // TODO: allocate the W5500 pins via WLED's PinManager (parity with the LoRa
-  // path) once the Stage-4 config UI exposes them.
+  //
+  // Reserve the W5500 pins via WLED's PinManager so a misconfigured LED bus on
+  // any of them fails loudly here instead of silently breaking the link. SCLK/
+  // MOSI/CS/RST are driven (output); MISO and INT are inputs.
+  const PinManagerPinType ethPins[] = {
+    { RACELINK_ETH_SCLK, true  },
+    { RACELINK_ETH_MOSI, true  },
+    { RACELINK_ETH_MISO, false },
+    { RACELINK_ETH_CS,   true  },
+    { RACELINK_ETH_RST,  true  },
+    { RACELINK_ETH_INT,  false },
+  };
+  if (!PinManager::allocateMultiplePins(ethPins, sizeof(ethPins) / sizeof(ethPins[0]),
+                                        PinOwner::UM_Unspecified)) {
+    DEBUG_PRINTLN(F("[RaceLink] W5500 pin allocation failed (LED bus conflict?)"));
+    radioInitCode = -998;
+    return false;
+  }
+
   radioInitCode = RaceLinkTransport::beginCommon(rl) ? 0 : -999;
   if (radioInitCode != 0) return false;
   rl.lbtEnable = false;                            // no LBT on a wired medium

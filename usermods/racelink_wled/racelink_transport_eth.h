@@ -289,17 +289,33 @@ inline void service(Core& rl, const Callbacks& cb) {
       rl.w5500.dhcpResult(rl.ip, rl.subnet, rl.gateway);
       rl.dhcpOk = true;
     } else if (st == RaceLinkW5500::Driver::DhcpState::Failed) {
-      const uint8_t sIp[4] = { RACELINK_ETH_IP };
-      const uint8_t sSub[4] = { RACELINK_ETH_SUBNET };
-      const uint8_t sGw[4] = { RACELINK_ETH_GATEWAY };
-      rl.w5500.setStaticIp(sIp, sSub, sGw);
-      for (int i = 0; i < 4; ++i) { rl.ip[i] = sIp[i]; rl.subnet[i] = sSub[i]; rl.gateway[i] = sGw[i]; }
-      rl.dhcpOk = false;
+      if (rl.w5500.isRenewing()) {
+        // Renewal failed -- keep the lease we already have (still valid until it
+        // actually expires) and just resume; dhcpRenewDue()'s throttle retries.
+        rl.w5500.setStaticIp(rl.ip, rl.subnet, rl.gateway);
+        rl.w5500.dhcpKeepLease();
+      } else {
+        // Initial acquisition failed -> static fallback.
+        const uint8_t sIp[4] = { RACELINK_ETH_IP };
+        const uint8_t sSub[4] = { RACELINK_ETH_SUBNET };
+        const uint8_t sGw[4] = { RACELINK_ETH_GATEWAY };
+        rl.w5500.setStaticIp(sIp, sSub, sGw);
+        for (int i = 0; i < 4; ++i) { rl.ip[i] = sIp[i]; rl.subnet[i] = sSub[i]; rl.gateway[i] = sGw[i]; }
+        rl.dhcpOk = false;
+      }
     } else {
       return;                                  // still negotiating
     }
     if (!rl.w5500.udpOpen(rl.nodePort)) return; // try again next tick on failure
     rl.netReady = true;
+  }
+
+  // Hold the lease alive: when ~85% of the lease has elapsed, rebind without
+  // blocking (drops back into the DHCP state machine above for a few ticks).
+  if (rl.dhcpOk && rl.w5500.dhcpRenewDue()) {
+    rl.netReady = false;
+    rl.w5500.dhcpBegin(/*renew=*/true);
+    return;
   }
 
   // parsePacket() reports the next datagram's payload size; read() must follow to
